@@ -1,0 +1,16 @@
+{
+  "name": "foot-cart-admin-standalone",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "express": "^4.22.2",
+    "pg": "^8.16.3"
+  }
+}
