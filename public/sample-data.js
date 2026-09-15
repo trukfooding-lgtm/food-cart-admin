@@ -13,7 +13,8 @@ export function createInitialState(){
  ];
  const users=[...people,...['สุภาวดี คงดี','กิตติพงษ์ วัฒนา','สมชาย ใจเย็น','อรทัย บุญมา','ลลิตา สดใส','สมพร รุ่งเรือง']].map((name,i)=>({id:'USR-'+String(i+1).padStart(3,'0'),name:i>=8?shops[i-8]:name,email:'member'+(i+1)+'@example.com',role:i<8?'Customer':'Shop',status:i===13?'ระงับบัญชี':'ใช้งานปกติ',joined:'1 ก.ย. 2569',shop:i<8?'—':shops[i-8],...(i>=8?shopProfiles[i-8]:{phone:'',category:'',lineId:'',facebook:'',lat:'',lng:''})}));
  const amounts=[185,120,240,85,350,95,160,210,145,70,290,135,250,175,480,60,310,220];
- const transactions=Array.from({length:18},(_,i)=>({id:'TXN-'+String(10428-i),orderId:'ORD-'+String(88428-i),person:people[i%8],shop:shops[i%6],amount:amounts[i],paymentStatus:i===9?'pending':i===11?'failed':'succeeded',refundStatus:i<5?'pending':i===6?'failed':i<8?'succeeded':'none',transactionTime:'5 ก.ย. 2569, '+(10-Math.floor(i/6))+':'+String(45-i%6*7).padStart(2,'0'),providerTransactionId:'PG-TXN-20260905-'+String(128-i),refundId:i<8?'PG-REF-'+String(202+i):'',refundDateTime:i<8?'5 ก.ย. 2569, 09:12':'',reference:''}));
- const notifications=[{id:'N-1',title:'มี Report ใหม่ 4 รายการ',body:'ตรวจสอบรายการที่มีความสำคัญสูงใน Notification Center',time:'วันนี้ 10:42',priority:'สูง',read:false},{id:'N-2',title:'Refund ผิดปกติจาก Payment Gateway',body:'เปิด Transaction Detail เพื่อตรวจสอบข้อมูล Provider',time:'วันนี้ 10:15',priority:'สูงสุด',read:false}];
+ // Payment / refund sample data is intentionally disabled until its separate scope is approved.
+ const transactions=[];
+ const notifications=[{id:'N-1',title:'มีรายงานใหม่ 4 รายการ',body:'ตรวจสอบรายการที่มีความสำคัญสูงในศูนย์รายงาน',time:'วันนี้ 10:42',priority:'สูง',read:false}];
  return {reports,users,transactions,notifications,history:[]};
 }

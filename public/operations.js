@@ -12,10 +12,9 @@ export function applyAction(input,action){
   const u=next.users.find(u=>u.id===action.id);if(!u)throw Error('ไม่พบบัญชี');
   if(!['ระงับบัญชี','ใช้งานปกติ'].includes(action.status)||!validText(action.reason,5,1000))throw Error('กรุณาระบุเหตุผลอย่างน้อย 5 ตัวอักษร');
   u.status=action.status;u.reason=action.reason.trim();u.suspensionHistory??=[];u.suspensionHistory.unshift({status:action.status,reason:u.reason,admin:action.admin||'Admin',at:now});audit=action.status+': '+u.reason;target=u.id;
- }else if(action.type==='refund.note'){
-  const t=next.transactions.find(t=>t.id===action.id);if(!t)throw Error('ไม่พบ Transaction');
-  if(!validText(action.note,5,1000))throw Error('กรุณาระบุรายละเอียดอย่างน้อย 5 ตัวอักษร');
-  next.notifications.unshift({id:crypto.randomUUID(),title:'ติดตาม Refund ผิดปกติ #'+t.id,body:action.note.trim(),time:now,priority:'สูงสุด',read:false,recipient:'ทีม Payment Provider',delivery:'รอติดตาม'});audit='บันทึกเหตุการณ์ Refund ผิดปกติ';target=t.id;
+ // Payment / refund operations are intentionally disabled until a separate scope is approved.
+ }else if(action.type==='refund.note'||String(action.type||'').startsWith('payment')){
+  throw Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
  }else if(action.type==='notification.read'){next.notifications.forEach(n=>{n.read=true});return next;
  }else throw Error('ไม่รองรับการดำเนินการนี้');
  next.history.unshift({id:crypto.randomUUID(),action:audit,target,time:now});return next;
