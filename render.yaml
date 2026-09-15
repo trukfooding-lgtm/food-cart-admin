@@ -14,3 +14,7 @@ services:
         sync: false
       - key: SESSION_SECRET
         sync: false
+      - key: ADMIN_PASSWORD_HASH
+        sync: false
+      - key: FOOD_CART_WEBHOOK_SECRET
+        sync: false

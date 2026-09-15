@@ -1,6 +1,7 @@
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import crypto from 'node:crypto';
+import {readFile} from 'node:fs/promises';
 import bcrypt from 'bcryptjs';
 import pg from 'pg';
 import {createInitialState} from './public/sample-data.js';
@@ -12,21 +13,30 @@ const port = Number(process.env.PORT || 10000);
 const email = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const password = String(process.env.ADMIN_PASSWORD || '');
 const sessionSecret = String(process.env.SESSION_SECRET || '');
-const userId = 'standalone-admin';
+const webhookSecret = String(process.env.FOOD_CART_WEBHOOK_SECRET || '');
+const adminId = `env:${email || 'administrator'}`;
+const workspaceId = 'standalone-admin';
 const pool = process.env.DATABASE_URL ? new Pool({connectionString: process.env.DATABASE_URL, ssl: {rejectUnauthorized: false}}) : null;
-let memory = {payload: createInitialState(), revision: 0};
+let memory = {payload: normalizeSnapshot(createInitialState()), revision: 0};
 
-app.use(express.json({limit: '32kb'}));
+app.use(express.json({limit: '256kb', verify: (req, _res, buf) => { req.rawBody = Buffer.from(buf); }}));
 app.use(cookieParser());
 app.use(express.static('public', {extensions: ['html']}));
 
 const json = (res, value, status = 200) => res.status(status).json(value);
-const sign = (value) => crypto.createHmac('sha256', sessionSecret || 'development-only-secret').update(value).digest('base64url');
+const now = () => new Date().toISOString();
+const text = (value, fallback = '') => String(value ?? fallback).trim();
+const validText = (value, min, max) => typeof value === 'string' && value.trim().length >= min && value.trim().length <= max;
+const safeDate = (value) => value ? new Date(value) : new Date();
+const displayTime = (value) => safeDate(value).toLocaleTimeString('th-TH', {hour: '2-digit', minute: '2-digit'});
+const displayDate = (value) => safeDate(value).toLocaleDateString('th-TH', {day: 'numeric', month: 'short', year: 'numeric'});
+const sign = (value, secret = sessionSecret || 'development-only-secret') => crypto.createHmac('sha256', secret).update(value).digest('base64url');
 const issueSession = () => {
   const exp = Date.now() + 8 * 60 * 60 * 1000;
   const body = `${email}|${exp}`;
   return `${body}.${sign(body)}`;
 };
+
 function validSession(req) {
   const token = req.cookies.admin_session || '';
   const dot = token.lastIndexOf('.');
@@ -38,44 +48,258 @@ function validSession(req) {
   const [tokenEmail, expiry] = body.split('|');
   return tokenEmail === email && Number(expiry) > Date.now();
 }
-function requireAdmin(req, res, next) {
+
+async function requireAdmin(req, res, next) {
   if (!email || (!password && !process.env.ADMIN_PASSWORD_HASH) || !sessionSecret) return json(res, {error: 'ยังไม่ได้ตั้งค่าบัญชีผู้ดูแลใน Render'}, 503);
   if (!validSession(req)) return json(res, {error: 'กรุณาเข้าสู่ระบบ'}, 401);
+  try {
+    let role = 'super_admin';
+    if (pool) {
+      const result = await pool.query('SELECT role FROM public.admin_roles WHERE admin_id = $1', [adminId]);
+      role = result.rows[0]?.role || 'viewer';
+    }
+    req.admin = {id: adminId, email, name: process.env.ADMIN_NAME || 'ผู้ดูแลระบบ', role};
+    next();
+  } catch {
+    return json(res, {error: 'ไม่สามารถตรวจสอบสิทธิ์ได้'}, 503);
+  }
+}
+
+const can = (admin, permission) => admin?.role === 'super_admin' || (permission === 'reports' && admin?.role === 'reviewer') || (permission === 'users' && admin?.role === 'user_manager');
+
+function requireWebhook(req, res, next) {
+  if (!webhookSecret) return json(res, {error: 'ยังไม่ได้ตั้งค่า FOOD_CART_WEBHOOK_SECRET'}, 503);
+  const received = String(req.get('x-foodcart-signature') || '');
+  const expected = sign(req.rawBody || Buffer.from(''), webhookSecret);
+  if (!received || received.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected))) return json(res, {error: 'ลายเซ็น Webhook ไม่ถูกต้อง'}, 401);
   next();
+}
+
+function normalizeSnapshot(input) {
+  return {
+    users: Array.isArray(input?.users) ? input.users : [],
+    reports: Array.isArray(input?.reports) ? input.reports : [],
+    notifications: (Array.isArray(input?.notifications) ? input.notifications : []).filter((notification) => !/(refund|payment gateway|ธุรกรรม|คืนเงิน)/i.test(`${notification?.title || ''} ${notification?.body || ''}`)),
+    history: Array.isArray(input?.history) ? input.history : [],
+    // Payment Gateway / transaction / refund UI ถูกปิดไว้ชั่วคราวตามขอบเขตที่อนุมัติ
+    transactions: []
+  };
+}
+
+function mapUser(row) {
+  return {
+    id: row.user_id,
+    name: row.display_name,
+    email: row.email || '',
+    role: row.role,
+    status: row.status,
+    reason: row.status_reason || '',
+    joined: row.joined_at ? displayDate(row.joined_at) : '',
+    shop: row.shop_name || '—',
+    phone: row.phone || '',
+    category: row.category || '',
+    lineId: row.line_id || '',
+    facebook: row.facebook_url || '',
+    lat: row.latitude == null ? '' : String(row.latitude),
+    lng: row.longitude == null ? '' : String(row.longitude)
+  };
+}
+
+function mapReport(row) {
+  return {
+    id: row.report_id,
+    name: row.title,
+    person: row.reporter_name || '',
+    shop: row.shop_name || '',
+    reporterType: row.reporter_type,
+    type: row.issue_type,
+    orderId: row.order_id || '',
+    status: row.status,
+    priority: row.priority,
+    time: displayTime(row.created_at),
+    userId: row.reporter_id || '',
+    note: row.note || '',
+    evidenceCount: Number(row.evidence_count || 0),
+    updatedAt: row.updated_at
+  };
+}
+
+function mapNotification(row) {
+  return {
+    id: row.notification_id,
+    title: row.title,
+    body: row.body,
+    time: row.created_at,
+    priority: row.priority,
+    read: Boolean(row.is_read),
+    recipient: row.recipient_id || '',
+    delivery: row.delivery_status
+  };
+}
+
+function mapHistory(row) {
+  return {id: row.action_id, action: row.action_type, target: row.target_id, time: row.created_at};
+}
+
+async function readSchema() {
+  return readFile(new URL('./supabase-admin.sql', import.meta.url), 'utf8');
+}
+
+async function ensureWorkspace(client) {
+  await client.query(`INSERT INTO public.admin_workspaces (user_id, payload, revision)
+    VALUES ($1, '{}'::jsonb, 0) ON CONFLICT (user_id) DO NOTHING`, [workspaceId]);
+}
+
+async function insertSeed(client, source) {
+  const state = normalizeSnapshot(source);
+  for (const user of state.users) {
+    await client.query(`INSERT INTO public.app_users
+      (user_id, display_name, email, role, status, status_reason, shop_name, phone, category, line_id, facebook_url, latitude, longitude, joined_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now()) ON CONFLICT (user_id) DO NOTHING`,
+      [user.id, text(user.name, 'ไม่ระบุชื่อ'), text(user.email), user.role === 'Shop' ? 'Shop' : 'Customer', user.status === 'ระงับบัญชี' ? 'ระงับบัญชี' : 'ใช้งานปกติ', text(user.reason), text(user.shop), text(user.phone), text(user.category), text(user.lineId), text(user.facebook), user.lat === '' ? null : Number(user.lat), user.lng === '' ? null : Number(user.lng)]);
+  }
+  for (const report of state.reports) {
+    await client.query(`INSERT INTO public.reports
+      (report_id, title, reporter_id, reporter_type, reporter_name, shop_name, issue_type, order_id, status, priority, note, evidence_count, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),now()) ON CONFLICT (report_id) DO NOTHING`,
+      [report.id, text(report.name, 'รายงานปัญหา'), text(report.userId), report.reporterType === 'Shop' ? 'Shop' : 'Customer', text(report.person), text(report.shop), text(report.type, 'Other'), text(report.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(report.status) ? report.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(report.priority) ? report.priority : 'ปกติ', text(report.note), Number(report.evidenceCount || 0)]);
+  }
+  for (const notification of state.notifications) {
+    await client.query(`INSERT INTO public.notifications
+      (notification_id, recipient_id, title, body, priority, is_read, delivery_status, created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT (notification_id) DO NOTHING`,
+      [notification.id, text(notification.recipient) || null, text(notification.title, 'การแจ้งเตือน'), text(notification.body), ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(notification.priority) ? notification.priority : 'ปกติ', Boolean(notification.read), text(notification.delivery, 'รอส่ง')]);
+  }
+  for (const action of state.history) {
+    await client.query(`INSERT INTO public.admin_actions
+      (action_id, admin_id, action_type, target_type, target_id, reason, created_at)
+      VALUES ($1,$2,$3,'legacy',$4,$5,now()) ON CONFLICT (action_id) DO NOTHING`,
+      [action.id || crypto.randomUUID(), adminId, text(action.action, 'การดำเนินการเดิม'), text(action.target, 'ไม่ระบุ'), text(action.action)]);
+  }
+}
+
+async function seedIfEmpty(client) {
+  const count = await client.query('SELECT (SELECT count(*) FROM public.app_users) AS users, (SELECT count(*) FROM public.reports) AS reports, (SELECT count(*) FROM public.notifications) AS notifications');
+  const empty = Number(count.rows[0].users) === 0 && Number(count.rows[0].reports) === 0 && Number(count.rows[0].notifications) === 0;
+  if (!empty) return;
+  const legacy = await client.query('SELECT payload FROM public.admin_workspaces WHERE user_id = $1', [workspaceId]);
+  const payload = legacy.rows[0]?.payload;
+  await insertSeed(client, payload && typeof payload === 'object' && Object.keys(payload).length ? payload : createInitialState());
 }
 
 async function ensureDb() {
   if (!pool) return;
-  await pool.query(`CREATE TABLE IF NOT EXISTS admin_workspaces (
-    user_id TEXT PRIMARY KEY,
-    payload JSONB NOT NULL,
-    revision INTEGER NOT NULL DEFAULT 0,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-  )`);
+  const client = await pool.connect();
+  try {
+    await client.query(await readSchema());
+    await client.query('BEGIN');
+    await ensureWorkspace(client);
+    if (email) await client.query(`INSERT INTO public.admin_roles (admin_id, email, display_name, role) VALUES ($1,$2,$3,'super_admin') ON CONFLICT (admin_id) DO UPDATE SET email=excluded.email, display_name=excluded.display_name, updated_at=now()`, [adminId, email, process.env.ADMIN_NAME || 'ผู้ดูแลระบบ']);
+    await seedIfEmpty(client);
+    const current = await snapshotFrom(client);
+    await client.query('UPDATE public.admin_workspaces SET payload=$1::jsonb, updated_at=now() WHERE user_id=$2', [JSON.stringify(current.data), workspaceId]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 }
+
+async function snapshotFrom(client) {
+  const [users, reports, notifications, history, workspace] = await Promise.all([
+    client.query('SELECT * FROM public.app_users ORDER BY created_at, user_id'),
+    client.query('SELECT * FROM public.reports ORDER BY created_at DESC, report_id'),
+    client.query('SELECT * FROM public.notifications ORDER BY created_at DESC, notification_id'),
+    client.query('SELECT action_id, action_type, target_id, created_at FROM public.admin_actions ORDER BY created_at DESC LIMIT 200'),
+    client.query('SELECT revision FROM public.admin_workspaces WHERE user_id = $1', [workspaceId])
+  ]);
+  return {
+    data: {users: users.rows.map(mapUser), reports: reports.rows.map(mapReport), notifications: notifications.rows.map(mapNotification), history: history.rows.map(mapHistory), transactions: []},
+    revision: Number(workspace.rows[0]?.revision || 0)
+  };
+}
+
 async function readWorkspace() {
   if (!pool) return memory;
-  const result = await pool.query('SELECT payload, revision FROM admin_workspaces WHERE user_id = $1', [userId]);
-  if (!result.rows.length) {
-    const payload = createInitialState();
-    await pool.query('INSERT INTO admin_workspaces (user_id, payload, revision) VALUES ($1, $2::jsonb, 0)', [userId, JSON.stringify(payload)]);
-    return {payload, revision: 0};
-  }
-  return {payload: result.rows[0].payload, revision: Number(result.rows[0].revision)};
+  const client = await pool.connect();
+  try { return await snapshotFrom(client); } finally { client.release(); }
 }
-async function writeWorkspace(next, revision) {
-  if (!pool) {
-    memory = {payload: next, revision: revision + 1};
-    return memory;
-  }
-  const result = await pool.query(`UPDATE admin_workspaces SET payload = $1::jsonb, revision = revision + 1, updated_at = now() WHERE user_id = $2 AND revision = $3 RETURNING revision`, [JSON.stringify(next), userId, revision]);
-  if (!result.rows.length) return null;
-  return {payload: next, revision: Number(result.rows[0].revision)};
+
+async function recordAction(client, admin, actionType, targetType, targetId, reason, metadata = {}) {
+  await client.query(`INSERT INTO public.admin_actions (action_id, admin_id, action_type, target_type, target_id, reason, metadata) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`, [crypto.randomUUID(), admin.id, actionType, targetType, targetId, reason || null, JSON.stringify(metadata)]);
+}
+
+async function writeRelationalAction(action, revision, admin) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const current = await client.query('SELECT revision FROM public.admin_workspaces WHERE user_id = $1 FOR UPDATE', [workspaceId]);
+    if (Number(current.rows[0]?.revision || 0) !== revision) throw Object.assign(new Error('ข้อมูลเปลี่ยนแปลง กรุณาโหลดใหม่'), {code: 'CONFLICT'});
+
+    if (action?.type === 'report.update') {
+      if (!can(admin, 'reports')) throw Object.assign(new Error('ไม่มีสิทธิ์แก้ไขรายงาน'), {code: 'FORBIDDEN'});
+      if (!['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(action.status) || !validText(action.note, 5, 2000)) throw new Error('ข้อมูลรายงานไม่ถูกต้อง');
+      const result = await client.query(`UPDATE public.reports SET status=$1, note=$2, updated_at=now() WHERE report_id=$3 RETURNING reporter_id, priority`, [action.status, action.note.trim(), action.id]);
+      if (!result.rows.length) throw new Error('ไม่พบรายงาน');
+      if (action.notify === true) await client.query(`INSERT INTO public.notifications (notification_id, recipient_id, source_type, source_id, title, body, priority, delivery_status) VALUES ($1,$2,'report',$3,$4,$5,$6,'รอส่ง')`, [crypto.randomUUID(), result.rows[0].reporter_id || null, action.id, `รายงาน #${action.id} อัปเดตแล้ว`, action.note.trim(), result.rows[0].priority || 'ปกติ']);
+      await recordAction(client, admin, `อัปเดต Report เป็น ${action.status}`, 'report', action.id, action.note);
+    } else if (action?.type === 'user.status') {
+      if (!can(admin, 'users')) throw Object.assign(new Error('ไม่มีสิทธิ์จัดการบัญชีผู้ใช้'), {code: 'FORBIDDEN'});
+      if (!['ระงับบัญชี', 'ใช้งานปกติ'].includes(action.status) || !validText(action.reason, 5, 1000)) throw new Error('ข้อมูลสถานะบัญชีไม่ถูกต้อง');
+      const result = await client.query(`UPDATE public.app_users SET status=$1, status_reason=$2, status_changed_by=$3, status_changed_at=now(), updated_at=now() WHERE user_id=$4 RETURNING user_id`, [action.status, action.reason.trim(), adminId, action.id]);
+      if (!result.rows.length) throw new Error('ไม่พบบัญชี');
+      await recordAction(client, admin, action.status, 'user', action.id, action.reason.trim());
+    } else if (action?.type === 'notification.read') {
+      await client.query(`UPDATE public.notifications SET is_read=true, read_at=COALESCE(read_at, now()), updated_at=now() WHERE is_read=false`);
+      await recordAction(client, admin, 'อ่านการแจ้งเตือนทั้งหมด', 'notification', 'all', 'ผู้ดูแลอ่านการแจ้งเตือน');
+    } else if (String(action?.type || '').startsWith('refund') || String(action?.type || '').startsWith('payment')) {
+      throw new Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
+    } else {
+      throw new Error('ไม่รองรับการดำเนินการนี้');
+    }
+
+    const next = await snapshotFrom(client);
+    const saved = await client.query(`UPDATE public.admin_workspaces SET payload=$1::jsonb, revision=revision+1, updated_at=now() WHERE user_id=$2 AND revision=$3 RETURNING revision`, [JSON.stringify(next.data), workspaceId, revision]);
+    if (!saved.rows.length) throw Object.assign(new Error('ข้อมูลเปลี่ยนแปลง กรุณาโหลดใหม่'), {code: 'CONFLICT'});
+    await client.query('COMMIT');
+    return {data: next.data, revision: Number(saved.rows[0].revision)};
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally { client.release(); }
+}
+
+async function handleIntegrationEvent(event) {
+  const eventId = text(event?.event_id || event?.eventId);
+  const eventType = text(event?.event_type || event?.eventType);
+  const data = event?.data && typeof event.data === 'object' ? event.data : {};
+  const supported = new Set(['user.upsert', 'order.upsert', 'report.created', 'report.updated', 'notification.created']);
+  if (!eventId || !supported.has(eventType)) throw new Error('event ไม่รองรับหรือไม่มี event_id');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const inserted = await client.query(`INSERT INTO public.integration_events (event_id, event_type, payload) VALUES ($1,$2,$3::jsonb) ON CONFLICT (event_id) DO NOTHING RETURNING event_id`, [eventId, eventType, JSON.stringify(event)]);
+    if (!inserted.rows.length) { await client.query('COMMIT'); return {duplicate: true}; }
+    if (eventType === 'user.upsert') {
+      await client.query(`INSERT INTO public.app_users (user_id, display_name, email, role, status, shop_name, phone, category, line_id, facebook_url, latitude, longitude, source_updated_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now()) ON CONFLICT (user_id) DO UPDATE SET display_name=excluded.display_name,email=excluded.email,role=excluded.role,shop_name=excluded.shop_name,phone=excluded.phone,category=excluded.category,line_id=excluded.line_id,facebook_url=excluded.facebook_url,latitude=excluded.latitude,longitude=excluded.longitude,source_updated_at=excluded.source_updated_at,updated_at=now()`, [text(data.user_id || data.id), text(data.display_name || data.name, 'ไม่ระบุชื่อ'), text(data.email) || null, data.role === 'Shop' ? 'Shop' : 'Customer', data.status === 'ระงับบัญชี' ? 'ระงับบัญชี' : 'ใช้งานปกติ', text(data.shop_name || data.shop), text(data.phone) || null, text(data.category) || null, text(data.line_id || data.lineId) || null, text(data.facebook_url || data.facebook) || null, data.latitude == null ? null : Number(data.latitude), data.longitude == null ? null : Number(data.longitude), data.source_updated_at ? safeDate(data.source_updated_at) : null]);
+    } else if (eventType === 'order.upsert') {
+      await client.query(`INSERT INTO public.app_orders (order_id, customer_id, merchant_id, total_amount, status, created_at, source_updated_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT (order_id) DO UPDATE SET customer_id=excluded.customer_id,merchant_id=excluded.merchant_id,total_amount=excluded.total_amount,status=excluded.status,source_updated_at=excluded.source_updated_at,updated_at=now()`, [text(data.order_id || data.id), text(data.customer_id) || null, text(data.merchant_id) || null, data.total_amount == null ? null : Number(data.total_amount), text(data.status) || null, data.created_at ? safeDate(data.created_at) : null, data.source_updated_at ? safeDate(data.source_updated_at) : null]);
+    } else if (eventType === 'report.created' || eventType === 'report.updated') {
+      await client.query(`INSERT INTO public.reports (report_id,title,reporter_id,reporter_type,reporter_name,shop_name,issue_type,order_id,status,priority,note,evidence_count,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now()) ON CONFLICT (report_id) DO UPDATE SET title=excluded.title,reporter_id=excluded.reporter_id,reporter_type=excluded.reporter_type,reporter_name=excluded.reporter_name,shop_name=excluded.shop_name,issue_type=excluded.issue_type,order_id=excluded.order_id,status=excluded.status,priority=excluded.priority,note=excluded.note,evidence_count=excluded.evidence_count,updated_at=now()`, [text(data.report_id || data.id), text(data.title || data.name, 'รายงานปัญหา'), text(data.reporter_id || data.user_id) || null, data.reporter_type === 'Shop' ? 'Shop' : 'Customer', text(data.reporter_name || data.person) || null, text(data.shop_name || data.shop) || null, text(data.issue_type || data.type, 'Other'), text(data.order_id || data.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(data.status) ? data.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ', text(data.note), Number(data.evidence_count || data.evidenceCount || 0), data.created_at ? safeDate(data.created_at) : new Date()]);
+      if (eventType === 'report.created') await client.query(`INSERT INTO public.notifications (notification_id, source_type, source_id, title, body, priority, delivery_status) VALUES ($1,'report',$2,$3,$4,$5,'รอส่ง')`, [crypto.randomUUID(), text(data.report_id || data.id), 'มีรายงานใหม่', text(data.title || data.name, 'มีรายงานใหม่'), ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ']);
+    } else if (eventType === 'notification.created') {
+      await client.query(`INSERT INTO public.notifications (notification_id,recipient_id,source_type,source_id,title,body,priority,delivery_status,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (notification_id) DO NOTHING`, [text(data.notification_id || data.id, crypto.randomUUID()), text(data.recipient_id) || null, text(data.source_type) || null, text(data.source_id) || null, text(data.title, 'การแจ้งเตือน'), text(data.body), ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ', text(data.delivery_status, 'รอส่ง'), data.created_at ? safeDate(data.created_at) : new Date()]);
+    }
+    await client.query('COMMIT');
+    return {duplicate: false};
+  } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; } finally { client.release(); }
 }
 
 app.get('/api/health', async (_req, res) => json(res, {success: true, database: Boolean(pool)}));
 app.post('/api/auth/login', async (req, res) => {
-  const identity = String(req.body?.identity || '').trim().toLowerCase();
+  const identity = text(req.body?.identity).toLowerCase();
   const submitted = String(req.body?.password || '');
   const configuredHash = String(process.env.ADMIN_PASSWORD_HASH || '');
   const valid = identity === email && (configuredHash ? await bcrypt.compare(submitted, configuredHash) : submitted === password);
@@ -84,26 +308,32 @@ app.post('/api/auth/login', async (req, res) => {
   return json(res, {success: true, account: {name: process.env.ADMIN_NAME || 'ผู้ดูแลระบบ', email}});
 });
 app.all('/api/auth/logout', (_req, res) => { res.clearCookie('admin_session'); return res.redirect('/'); });
-app.get('/api/admin', requireAdmin, async (_req, res) => {
-  try {
-    const workspace = await readWorkspace();
-    return json(res, {data: workspace.payload, revision: workspace.revision, account: {name: process.env.ADMIN_NAME || 'ผู้ดูแลระบบ', email}});
-  } catch (error) {
-    console.error(error);
-    return json(res, {error: 'ไม่สามารถโหลดข้อมูลได้'}, 503);
-  }
+
+app.post('/api/integration/events', requireWebhook, async (req, res) => {
+  try { return json(res, {success: true, ...(await handleIntegrationEvent(req.body))}); }
+  catch (error) { return json(res, {error: error instanceof Error ? error.message : 'รับข้อมูลไม่สำเร็จ'}, 400); }
 });
+
+app.get('/api/admin', requireAdmin, async (_req, res) => {
+  try { const workspace = await readWorkspace(); return json(res, {data: workspace.data || workspace.payload, revision: workspace.revision, account: {name: process.env.ADMIN_NAME || 'ผู้ดูแลระบบ', email}}); }
+  catch (error) { console.error(error); return json(res, {error: 'ไม่สามารถโหลดข้อมูลได้'}, 503); }
+});
+
 app.post('/api/admin', requireAdmin, async (req, res) => {
   const revision = Number(req.body?.revision);
   if (!Number.isInteger(revision) || !req.body?.action) return json(res, {error: 'ข้อมูลไม่ถูกต้อง'}, 400);
   try {
-    const workspace = await readWorkspace();
-    if (workspace.revision !== revision) return json(res, {error: 'ข้อมูลเปลี่ยนแปลง กรุณาโหลดใหม่'}, 409);
-    const next = applyAction(workspace.payload, req.body.action);
-    const saved = await writeWorkspace(next, revision);
-    if (!saved) return json(res, {error: 'ข้อมูลเปลี่ยนแปลง กรุณาโหลดใหม่'}, 409);
-    return json(res, {data: saved.payload, revision: saved.revision});
+    if (pool) {
+      const saved = await writeRelationalAction(req.body.action, revision, req.admin);
+      return json(res, saved);
+    }
+    if (memory.revision !== revision) return json(res, {error: 'ข้อมูลเปลี่ยนแปลง กรุณาโหลดใหม่'}, 409);
+    if (String(req.body.action.type || '').startsWith('refund') || String(req.body.action.type || '').startsWith('payment')) throw new Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
+    memory = {payload: normalizeSnapshot(applyAction(memory.payload, req.body.action)), revision: revision + 1};
+    return json(res, {data: memory.payload, revision: memory.revision});
   } catch (error) {
+    if (error?.code === 'CONFLICT') return json(res, {error: error.message}, 409);
+    if (error?.code === 'FORBIDDEN') return json(res, {error: error.message}, 403);
     return json(res, {error: error instanceof Error ? error.message : 'บันทึกไม่สำเร็จ'}, 400);
   }
 });

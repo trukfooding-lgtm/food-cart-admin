@@ -18,6 +18,8 @@ ADMIN_EMAIL=อีเมลผู้ดูแล
 ADMIN_PASSWORD=รหัสผ่านผู้ดูแล
 SESSION_SECRET=ข้อความสุ่มยาวอย่างน้อย 32 ตัวอักษร
 ADMIN_NAME=ผู้ดูแลระบบ
+ADMIN_PASSWORD_HASH=แฮชรหัสผ่าน (ใช้แทน ADMIN_PASSWORD ได้)
+FOOD_CART_WEBHOOK_SECRET=ข้อความลับสำหรับตรวจสอบ Webhook จากแอปหลัก
 ```
 
 `DATABASE_URL` ใช้เฉพาะฝั่งเซิร์ฟเวอร์ ไม่ถูกส่งไปยังเบราว์เซอร์
@@ -26,6 +28,16 @@ ADMIN_NAME=ผู้ดูแลระบบ
 
 เปิด `/api/health` ต้องได้ JSON ที่มี `success: true` และ `database: true`
 
-เว็บจะสร้างตาราง `admin_workspaces` อัตโนมัติเมื่อเริ่มทำงาน ตารางนี้เก็บข้อมูลตามขอบเขต Admin ได้แก่ ผู้ใช้งาน รายงาน คำสั่งซื้อ ธุรกรรม การคืนเงิน การแจ้งเตือน และประวัติการดำเนินการ
+เว็บจะสร้างตารางตามฟังก์ชัน Admin อัตโนมัติเมื่อเริ่มทำงาน ได้แก่ `admin_roles`, `app_users`, `app_orders`, `reports`, `notifications`, `admin_actions` และ `integration_events`
 
-ข้อมูลตัวอย่างจะถูกสร้างเมื่อเข้าสู่ระบบครั้งแรก และการแก้ไขจะถูกบันทึกใน Supabase
+ตาราง `admin_workspaces` ยังเก็บไว้เป็นข้อมูลเข้ากันได้กับรุ่นเดิม และจะย้ายข้อมูลตัวอย่างเดิมไปยังตารางแยกเมื่อเริ่มระบบครั้งแรก
+
+ฟังก์ชันการชำระเงิน Payment Gateway และการคืนเงินถูกปิดไว้ชั่วคราว จึงไม่มีตาราง `transactions` หรือ `refunds`
+
+ข้อมูลตัวอย่างจะถูกสร้างเมื่อฐานข้อมูลยังว่าง และการแก้ไขจะถูกบันทึกใน Supabase
+
+## Webhook จากแอปหลัก
+
+ส่ง `POST /api/integration/events` จากเซิร์ฟเวอร์ของแอปหลัก พร้อม Header `x-foodcart-signature` ซึ่งเป็น HMAC-SHA256 ของ body ด้วย `FOOD_CART_WEBHOOK_SECRET`
+
+ประเภทที่รองรับในระยะนี้: `user.upsert`, `order.upsert`, `report.created`, `report.updated`, `notification.created`
