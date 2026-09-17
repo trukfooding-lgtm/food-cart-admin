@@ -13,9 +13,37 @@ create table if not exists public.admin_roles (
   email text not null unique,
   display_name text not null default 'ผู้ดูแลระบบ',
   role text not null default 'viewer' check (role in ('viewer', 'reviewer', 'user_manager', 'super_admin')),
+  auth_user_id uuid,
+  status text not null default 'active' check (status in ('active', 'disabled')),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+-- รองรับแอดมิน 2–3 คน โดยไม่เก็บรหัสผ่านไว้ในตาราง
+alter table public.admin_roles add column if not exists auth_user_id uuid;
+alter table public.admin_roles add column if not exists status text not null default 'active';
+create unique index if not exists admin_roles_auth_user_id_idx on public.admin_roles (auth_user_id) where auth_user_id is not null;
+
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'admin_roles_status_check') then
+    alter table public.admin_roles add constraint admin_roles_status_check check (status in ('active', 'disabled'));
+  end if;
+end $$;
+
+create or replace function public.limit_active_admin_roles()
+returns trigger language plpgsql as $$
+begin
+  if new.status = 'active' and (select count(*) from public.admin_roles where status = 'active' and admin_id <> new.admin_id) >= 3 then
+    raise exception 'รองรับแอดมินที่ใช้งานได้ไม่เกิน 3 คน';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_limit_active_admin_roles on public.admin_roles;
+create trigger trg_limit_active_admin_roles
+before insert or update of status on public.admin_roles
+for each row execute function public.limit_active_admin_roles();
 
 create table if not exists public.app_users (
   user_id text primary key,

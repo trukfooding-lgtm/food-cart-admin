@@ -13,6 +13,8 @@ const port = Number(process.env.PORT || 10000);
 const email = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const password = String(process.env.ADMIN_PASSWORD || '');
 const sessionSecret = String(process.env.SESSION_SECRET || '');
+const supabaseUrl = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const supabasePublishableKey = String(process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || '');
 const webhookSecret = String(process.env.FOOD_CART_WEBHOOK_SECRET || '');
 const adminId = `env:${email || 'administrator'}`;
 const workspaceId = 'standalone-admin';
@@ -31,34 +33,43 @@ const safeDate = (value) => value ? new Date(value) : new Date();
 const displayTime = (value) => safeDate(value).toLocaleTimeString('th-TH', {hour: '2-digit', minute: '2-digit'});
 const displayDate = (value) => safeDate(value).toLocaleDateString('th-TH', {day: 'numeric', month: 'short', year: 'numeric'});
 const sign = (value, secret = sessionSecret || 'development-only-secret') => crypto.createHmac('sha256', secret).update(value).digest('base64url');
-const issueSession = () => {
+const issueSession = (loginEmail = email) => {
   const exp = Date.now() + 8 * 60 * 60 * 1000;
-  const body = `${email}|${exp}`;
+  const body = `${loginEmail}|${exp}`;
   return `${body}.${sign(body)}`;
 };
 
-function validSession(req) {
+async function findAdmin(loginEmail) {
+  const normalized = text(loginEmail).toLowerCase();
+  if (!normalized) return null;
+  if (pool) {
+    const result = await pool.query(`SELECT admin_id,email,display_name,role,status
+      FROM public.admin_roles WHERE lower(email)=lower($1) AND status='active' LIMIT 1`, [normalized]);
+    if (result.rows[0]) return result.rows[0];
+  }
+  if (normalized === email) return {admin_id: adminId, email, display_name: process.env.ADMIN_NAME || 'ผู้ดูแลระบบ', role: 'super_admin', status: 'active'};
+  return null;
+}
+
+async function validSession(req) {
   const token = req.cookies.admin_session || '';
   const dot = token.lastIndexOf('.');
-  if (dot < 1) return false;
+  if (dot < 1) return null;
   const body = token.slice(0, dot);
   const signature = token.slice(dot + 1);
   const expected = sign(body);
-  if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return false;
+  if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
   const [tokenEmail, expiry] = body.split('|');
-  return tokenEmail === email && Number(expiry) > Date.now();
+  if (!tokenEmail || Number(expiry) <= Date.now()) return null;
+  return findAdmin(tokenEmail);
 }
 
 async function requireAdmin(req, res, next) {
-  if (!email || (!password && !process.env.ADMIN_PASSWORD_HASH) || !sessionSecret) return json(res, {error: 'ยังไม่ได้ตั้งค่าบัญชีผู้ดูแลใน Render'}, 503);
-  if (!validSession(req)) return json(res, {error: 'กรุณาเข้าสู่ระบบ'}, 401);
+  if (!sessionSecret || (!email && !(supabaseUrl && supabasePublishableKey))) return json(res, {error: 'ยังไม่ได้ตั้งค่าบัญชีผู้ดูแลใน Render'}, 503);
   try {
-    let role = 'super_admin';
-    if (pool) {
-      const result = await pool.query('SELECT role FROM public.admin_roles WHERE admin_id = $1', [adminId]);
-      role = result.rows[0]?.role || 'viewer';
-    }
-    req.admin = {id: adminId, email, name: process.env.ADMIN_NAME || 'ผู้ดูแลระบบ', role};
+    const admin = await validSession(req);
+    if (!admin) return json(res, {error: 'กรุณาเข้าสู่ระบบ'}, 401);
+    req.admin = {id: admin.admin_id, email: admin.email, name: admin.display_name || 'ผู้ดูแลระบบ', role: admin.role || 'viewer'};
     next();
   } catch {
     return json(res, {error: 'ไม่สามารถตรวจสอบสิทธิ์ได้'}, 503);
@@ -341,10 +352,22 @@ app.post('/api/auth/login', async (req, res) => {
   const identity = text(req.body?.identity).toLowerCase();
   const submitted = String(req.body?.password || '');
   const configuredHash = String(process.env.ADMIN_PASSWORD_HASH || '');
-  const valid = identity === email && (configuredHash ? await bcrypt.compare(submitted, configuredHash) : submitted === password);
+  let valid = identity === email && (configuredHash ? await bcrypt.compare(submitted, configuredHash) : submitted === password);
+  if (!valid && supabaseUrl && supabasePublishableKey) {
+    try {
+      const response = await fetch(`${supabaseUrl}/auth/v1/token?grant_type=password`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', apikey: supabasePublishableKey},
+        body: JSON.stringify({email: identity, password: submitted})
+      });
+      valid = response.ok;
+    } catch { valid = false; }
+  }
   if (!valid) return json(res, {error: 'อีเมลหรือรหัสผ่านไม่ถูกต้อง'}, 401);
-  res.cookie('admin_session', issueSession(), {httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 8 * 60 * 60 * 1000});
-  return json(res, {success: true, account: {name: process.env.ADMIN_NAME || 'ผู้ดูแลระบบ', email}});
+  const admin = await findAdmin(identity);
+  if (!admin) return json(res, {error: 'บัญชีนี้ยังไม่ได้รับสิทธิ์แอดมิน'}, 403);
+  res.cookie('admin_session', issueSession(identity), {httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 8 * 60 * 60 * 1000});
+  return json(res, {success: true, account: {name: admin.display_name || 'ผู้ดูแลระบบ', email: admin.email}});
 });
 app.all('/api/auth/logout', (_req, res) => { res.clearCookie('admin_session'); return res.redirect('/'); });
 
