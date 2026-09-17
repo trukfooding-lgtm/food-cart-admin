@@ -69,10 +69,49 @@ const can = (admin, permission) => admin?.role === 'super_admin' || (permission 
 
 function requireWebhook(req, res, next) {
   if (!webhookSecret) return json(res, {error: 'ยังไม่ได้ตั้งค่า FOOD_CART_WEBHOOK_SECRET'}, 503);
+  const directSecret = String(req.get('x-foodcart-webhook-secret') || '').trim();
+  if (directSecret && directSecret === webhookSecret) return next();
   const received = String(req.get('x-foodcart-signature') || '');
   const expected = sign(req.rawBody || Buffer.from(''), webhookSecret);
   if (!received || received.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected))) return json(res, {error: 'ลายเซ็น Webhook ไม่ถูกต้อง'}, 401);
   next();
+}
+
+function normalizeSupabaseWebhook(payload) {
+  const table = text(payload?.table).toLowerCase();
+  const operation = text(payload?.type).toUpperCase();
+  const row = payload?.record && typeof payload.record === 'object' ? payload.record : {};
+  const id = text(row.id || row.customer_id || row.user_id || row.order_id || row.notification_id);
+  if (text(payload?.schema, 'public') !== 'public' || !id || operation === 'DELETE') return null;
+  const updatedAt = text(row.updated_at || row.created_at || new Date().toISOString());
+  const eventId = `supabase:${table}:${operation}:${id}:${updatedAt}`;
+  if (table === 'customer') return {event_id: eventId, event_type: 'user.upsert', data: {
+    user_id: row.customer_id || id, display_name: row.name_surname, email: row.email,
+    role: 'Customer', phone: row.phone, source_updated_at: updatedAt
+  }};
+  if (table === 'merchant') return {event_id: eventId, event_type: 'user.upsert', data: {
+    user_id: row.id || id, display_name: row.name, email: row.email, role: 'Shop',
+    shop_name: row.name, phone: row.store_phone, category: row.type, line_id: row.line_id,
+    facebook_url: row.facebook_url, latitude: row.latitude, longitude: row.longitude,
+    source_updated_at: updatedAt
+  }};
+  if (table === 'orders') return {event_id: eventId, event_type: 'order.upsert', data: {
+    order_id: row.id || id, customer_id: row.customer_id, merchant_id: row.merchant_id,
+    total_amount: row.total_price, status: row.status, created_at: row.created_at,
+    source_updated_at: updatedAt
+  }};
+  if (table === 'merchant_issue_reports') return {event_id: eventId, event_type: operation === 'INSERT' ? 'report.created' : 'report.updated', data: {
+    report_id: row.id || id, title: row.issue_type, reporter_id: row.merchant_id,
+    reporter_type: 'Shop', issue_type: row.issue_type, order_id: row.order_reference,
+    note: row.details, status: row.status, created_at: row.created_at, source_updated_at: updatedAt,
+    evidence_count: row.image_url ? 1 : 0
+  }};
+  if (table === 'notifications' || table === 'merchant_notifications') return {event_id: eventId, event_type: 'notification.created', data: {
+    notification_id: row.id || id, recipient_id: row.user_id || row.customer_id || row.merchant_id,
+    source_type: row.source_type || 'order', source_id: row.source_id || row.order_id,
+    title: row.title, body: row.body || row.message, created_at: row.created_at
+  }};
+  return null;
 }
 
 function normalizeSnapshot(input) {
@@ -312,6 +351,15 @@ app.all('/api/auth/logout', (_req, res) => { res.clearCookie('admin_session'); r
 app.post('/api/integration/events', requireWebhook, async (req, res) => {
   try { return json(res, {success: true, ...(await handleIntegrationEvent(req.body))}); }
   catch (error) { return json(res, {error: error instanceof Error ? error.message : 'รับข้อมูลไม่สำเร็จ'}, 400); }
+});
+
+// รับ Supabase Database Webhooks โดยตรง ไม่ต้องแก้ Backend ของแอปหลัก
+app.post('/api/integration/supabase-webhook', requireWebhook, async (req, res) => {
+  try {
+    const event = normalizeSupabaseWebhook(req.body);
+    if (!event) return json(res, {success: true, ignored: true});
+    return json(res, {success: true, ...(await handleIntegrationEvent(event))});
+  } catch (error) { return json(res, {error: error instanceof Error ? error.message : 'รับข้อมูลไม่สำเร็จ'}, 400); }
 });
 
 app.get('/api/admin', requireAdmin, async (_req, res) => {
