@@ -113,6 +113,8 @@ function normalizeSupabaseWebhook(payload) {
   }};
   if (table === 'merchant_issue_reports') return {event_id: eventId, event_type: operation === 'INSERT' ? 'report.created' : 'report.updated', data: {
     report_id: row.id || id, title: row.issue_type, reporter_id: row.merchant_id,
+    reporter_name: row.reporter_name || row.merchant_name || row.shop_name,
+    shop_name: row.shop_name || row.merchant_name,
     reporter_type: 'Shop', issue_type: row.issue_type, order_id: row.order_reference,
     note: row.details, status: row.status, created_at: row.created_at, source_updated_at: updatedAt,
     evidence_count: row.image_url ? 1 : 0
