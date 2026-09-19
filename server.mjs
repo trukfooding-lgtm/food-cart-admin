@@ -4,7 +4,6 @@ import crypto from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import bcrypt from 'bcryptjs';
 import pg from 'pg';
-import {createInitialState} from './public/sample-data.js';
 import {applyAction} from './public/operations.js';
 
 const {Pool} = pg;
@@ -19,7 +18,7 @@ const webhookSecret = String(process.env.FOOD_CART_WEBHOOK_SECRET || '');
 const adminId = `env:${email || 'administrator'}`;
 const workspaceId = 'standalone-admin';
 const pool = process.env.DATABASE_URL ? new Pool({connectionString: process.env.DATABASE_URL, ssl: {rejectUnauthorized: false}}) : null;
-let memory = {payload: normalizeSnapshot(createInitialState()), revision: 0};
+let memory = {payload: normalizeSnapshot({}), revision: 0};
 
 app.use(express.json({limit: '256kb', verify: (req, _res, buf) => { req.rawBody = Buffer.from(buf); }}));
 app.use(cookieParser());
@@ -93,26 +92,33 @@ function normalizeSupabaseWebhook(payload) {
   const operation = text(payload?.type).toUpperCase();
   const row = payload?.record && typeof payload.record === 'object' ? payload.record : {};
   const id = text(row.id || row.customer_id || row.user_id || row.order_id || row.notification_id);
-  if (text(payload?.schema, 'public') !== 'public' || !id || operation === 'DELETE') return null;
+  if (text(payload?.schema, 'public') !== 'public' || !id) return null;
   const updatedAt = text(row.updated_at || row.created_at || new Date().toISOString());
   const eventId = `supabase:${table}:${operation}:${id}:${updatedAt}`;
-  if (table === 'customer') return {event_id: eventId, event_type: 'user.upsert', data: {
-    user_id: row.customer_id || id, display_name: row.name_surname, email: row.email,
-    role: 'Customer', phone: row.phone, source_updated_at: updatedAt
-  }};
-  if (table === 'merchant') return {event_id: eventId, event_type: 'user.upsert', data: {
-    user_id: row.id || id, display_name: row.name, email: row.email, role: 'Shop',
-    shop_name: row.name, phone: row.store_phone, category: row.type, line_id: row.line_id,
-    facebook_url: row.facebook_url, latitude: row.latitude, longitude: row.longitude,
-    source_updated_at: updatedAt
-  }};
+  if (table === 'customer') {
+    const userId = `customer:${row.customer_id || id}`;
+    if (operation === 'DELETE') return {event_id: eventId, event_type: 'user.delete', data: {user_id: userId, role: 'Customer', source_updated_at: updatedAt}};
+    return {event_id: eventId, event_type: 'user.upsert', data: {
+      user_id: userId, display_name: row.name_surname, email: row.email,
+      role: 'Customer', phone: row.phone, source_updated_at: updatedAt
+    }};
+  }
+  if (table === 'merchant') {
+    const userId = `merchant:${row.id || id}`;
+    if (operation === 'DELETE') return {event_id: eventId, event_type: 'user.delete', data: {user_id: userId, role: 'Shop', source_updated_at: updatedAt}};
+    return {event_id: eventId, event_type: 'user.upsert', data: {
+      user_id: userId, display_name: row.name, email: row.email, role: 'Shop',
+      shop_name: row.name, phone: row.store_phone, category: row.type, line_id: row.line_id,
+      facebook_url: row.facebook_url, source_updated_at: updatedAt
+    }};
+  }
   if (table === 'orders') return {event_id: eventId, event_type: 'order.upsert', data: {
     order_id: row.id || id, customer_id: row.customer_id, merchant_id: row.merchant_id,
     total_amount: row.total_price, status: row.status, created_at: row.created_at,
     source_updated_at: updatedAt
   }};
   if (table === 'merchant_issue_reports') return {event_id: eventId, event_type: operation === 'INSERT' ? 'report.created' : 'report.updated', data: {
-    report_id: row.id || id, title: row.issue_type, reporter_id: row.merchant_id,
+    report_id: row.id || id, title: row.issue_type, reporter_id: row.merchant_id == null ? null : `merchant:${row.merchant_id}`,
     reporter_name: row.reporter_name || row.merchant_name || row.shop_name,
     shop_name: row.shop_name || row.merchant_name,
     reporter_type: 'Shop', issue_type: row.issue_type, order_id: row.order_reference,
@@ -202,43 +208,6 @@ async function ensureWorkspace(client) {
     VALUES ($1, '{}'::jsonb, 0) ON CONFLICT (user_id) DO NOTHING`, [workspaceId]);
 }
 
-async function insertSeed(client, source) {
-  const state = normalizeSnapshot(source);
-  for (const user of state.users) {
-    await client.query(`INSERT INTO public.app_users
-      (user_id, display_name, email, role, status, status_reason, shop_name, phone, category, line_id, facebook_url, latitude, longitude, joined_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now()) ON CONFLICT (user_id) DO NOTHING`,
-      [user.id, text(user.name, 'ไม่ระบุชื่อ'), text(user.email), user.role === 'Shop' ? 'Shop' : 'Customer', user.status === 'ระงับบัญชี' ? 'ระงับบัญชี' : 'ใช้งานปกติ', text(user.reason), text(user.shop), text(user.phone), text(user.category), text(user.lineId), text(user.facebook), user.lat === '' ? null : Number(user.lat), user.lng === '' ? null : Number(user.lng)]);
-  }
-  for (const report of state.reports) {
-    await client.query(`INSERT INTO public.reports
-      (report_id, title, reporter_id, reporter_type, reporter_name, shop_name, issue_type, order_id, status, priority, note, evidence_count, created_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),now()) ON CONFLICT (report_id) DO NOTHING`,
-      [report.id, text(report.name, 'รายงานปัญหา'), text(report.userId), report.reporterType === 'Shop' ? 'Shop' : 'Customer', text(report.person), text(report.shop), text(report.type, 'Other'), text(report.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(report.status) ? report.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(report.priority) ? report.priority : 'ปกติ', text(report.note), Number(report.evidenceCount || 0)]);
-  }
-  for (const notification of state.notifications) {
-    await client.query(`INSERT INTO public.notifications
-      (notification_id, recipient_id, title, body, priority, is_read, delivery_status, created_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT (notification_id) DO NOTHING`,
-      [notification.id, text(notification.recipient) || null, text(notification.title, 'การแจ้งเตือน'), text(notification.body), ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(notification.priority) ? notification.priority : 'ปกติ', Boolean(notification.read), text(notification.delivery, 'รอส่ง')]);
-  }
-  for (const action of state.history) {
-    await client.query(`INSERT INTO public.admin_actions
-      (action_id, admin_id, action_type, target_type, target_id, reason, created_at)
-      VALUES ($1,$2,$3,'legacy',$4,$5,now()) ON CONFLICT (action_id) DO NOTHING`,
-      [action.id || crypto.randomUUID(), adminId, text(action.action, 'การดำเนินการเดิม'), text(action.target, 'ไม่ระบุ'), text(action.action)]);
-  }
-}
-
-async function seedIfEmpty(client) {
-  const count = await client.query('SELECT (SELECT count(*) FROM public.app_users) AS users, (SELECT count(*) FROM public.reports) AS reports, (SELECT count(*) FROM public.notifications) AS notifications');
-  const empty = Number(count.rows[0].users) === 0 && Number(count.rows[0].reports) === 0 && Number(count.rows[0].notifications) === 0;
-  if (!empty) return;
-  const legacy = await client.query('SELECT payload FROM public.admin_workspaces WHERE user_id = $1', [workspaceId]);
-  const payload = legacy.rows[0]?.payload;
-  await insertSeed(client, payload && typeof payload === 'object' && Object.keys(payload).length ? payload : createInitialState());
-}
-
 async function ensureDb() {
   if (!pool) return;
   const client = await pool.connect();
@@ -247,7 +216,6 @@ async function ensureDb() {
     await client.query('BEGIN');
     await ensureWorkspace(client);
     if (email) await client.query(`INSERT INTO public.admin_roles (admin_id, email, display_name, role) VALUES ($1,$2,$3,'super_admin') ON CONFLICT (admin_id) DO UPDATE SET email=excluded.email, display_name=excluded.display_name, updated_at=now()`, [adminId, email, process.env.ADMIN_NAME || 'ผู้ดูแลระบบ']);
-    await seedIfEmpty(client);
     const current = await snapshotFrom(client);
     await client.query('UPDATE public.admin_workspaces SET payload=$1::jsonb, updated_at=now() WHERE user_id=$2', [JSON.stringify(current.data), workspaceId]);
     await client.query('COMMIT');
@@ -327,7 +295,7 @@ async function handleIntegrationEvent(event) {
   const eventId = text(event?.event_id || event?.eventId);
   const eventType = text(event?.event_type || event?.eventType);
   const data = event?.data && typeof event.data === 'object' ? event.data : {};
-  const supported = new Set(['user.upsert', 'order.upsert', 'report.created', 'report.updated', 'notification.created']);
+  const supported = new Set(['user.upsert', 'user.delete', 'order.upsert', 'report.created', 'report.updated', 'notification.created']);
   if (!eventId || !supported.has(eventType)) throw new Error('event ไม่รองรับหรือไม่มี event_id');
   const client = await pool.connect();
   try {
@@ -336,6 +304,8 @@ async function handleIntegrationEvent(event) {
     if (!inserted.rows.length) { await client.query('COMMIT'); return {duplicate: true}; }
     if (eventType === 'user.upsert') {
       await client.query(`INSERT INTO public.app_users (user_id, display_name, email, role, status, shop_name, phone, category, line_id, facebook_url, latitude, longitude, source_updated_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now()) ON CONFLICT (user_id) DO UPDATE SET display_name=excluded.display_name,email=excluded.email,role=excluded.role,shop_name=excluded.shop_name,phone=excluded.phone,category=excluded.category,line_id=excluded.line_id,facebook_url=excluded.facebook_url,latitude=excluded.latitude,longitude=excluded.longitude,source_updated_at=excluded.source_updated_at,updated_at=now()`, [text(data.user_id || data.id), text(data.display_name || data.name, 'ไม่ระบุชื่อ'), text(data.email) || null, data.role === 'Shop' ? 'Shop' : 'Customer', data.status === 'ระงับบัญชี' ? 'ระงับบัญชี' : 'ใช้งานปกติ', text(data.shop_name || data.shop), text(data.phone) || null, text(data.category) || null, text(data.line_id || data.lineId) || null, text(data.facebook_url || data.facebook) || null, data.latitude == null ? null : Number(data.latitude), data.longitude == null ? null : Number(data.longitude), data.source_updated_at ? safeDate(data.source_updated_at) : null]);
+    } else if (eventType === 'user.delete') {
+      await client.query('DELETE FROM public.app_users WHERE user_id=$1', [text(data.user_id || data.id)]);
     } else if (eventType === 'order.upsert') {
       await client.query(`INSERT INTO public.app_orders (order_id, customer_id, merchant_id, total_amount, status, created_at, source_updated_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT (order_id) DO UPDATE SET customer_id=excluded.customer_id,merchant_id=excluded.merchant_id,total_amount=excluded.total_amount,status=excluded.status,source_updated_at=excluded.source_updated_at,updated_at=now()`, [text(data.order_id || data.id), text(data.customer_id) || null, text(data.merchant_id) || null, data.total_amount == null ? null : Number(data.total_amount), text(data.status) || null, data.created_at ? safeDate(data.created_at) : null, data.source_updated_at ? safeDate(data.source_updated_at) : null]);
     } else if (eventType === 'report.created' || eventType === 'report.updated') {

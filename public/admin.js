@@ -1,6 +1,5 @@
 import icons from './icons.js';
 import {applyAction} from './operations.js';
-import {createInitialState} from './sample-data.js';
 const $=s=>document.querySelector(s);
 const escape=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const icon=n=>icons[n]||icons['circle-help'];
@@ -15,10 +14,9 @@ const notificationText=s=>String(s??'').replaceAll('Payment Provider','ผู้
 const notificationTime=s=>{const text=String(s??'');if(!/^\d{4}-\d{2}-\d{2}T/.test(text))return text;const date=new Date(text);return Number.isNaN(date.getTime())?text:date.toLocaleString('th-TH',{day:'numeric',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'})};
 const people=['กมลชนก ใจดี','ณัฐวุฒิ ศรีสุข','พิมพ์ชนก วงศ์ดี','ธนกร มีทรัพย์','วราภรณ์ แสงทอง','สุรชัย พูนสุข','นภัสสร จันทรา','ศุภชัย อินทร์แก้ว'];
 const shops=['ครัวป้าสุ รถกับข้าว','Coffee on Wheels','ผลไม้สด ลุงชัย','ขนมหวานบ้านอิ่ม','ผักสดจากสวน','ปังปิ้ง พี่หมี'];
-const seed=createInitialState();let reports=seed.reports;let users=seed.users;let transactions=[];let notifications=seed.notifications.filter(n=>!/(refund|payment gateway|ธุรกรรม|คืนเงิน)/i.test(`${n.title} ${n.body}`));let history=seed.history;
+let reports=[];let users=[];let transactions=[];let notifications=[];let history=[];
 let state={page:'overview',query:'',filter:'ทั้งหมด',tab:'ทั้งหมด',pageNumber:1,period:'7',busy:false};let connected=false;let account=null;let currentRecord=null;let confirmHandler=null;let authState='checking';
-function showLogin(show=true){authState=show?'login':'demo';const view=document.querySelector('#login-view');if(view)view.hidden=!show;document.body.classList.toggle('auth-required',show);refreshIcons()}
-function showDemo(){showLogin(false);connected=false;render();toast('โหมดตัวอย่าง: การแก้ไขจะอยู่ชั่วคราวจนกว่าจะเข้าสู่ระบบ')}
+function showLogin(show=true){authState=show?'login':'app';const view=document.querySelector('#login-view');if(view)view.hidden=!show;document.body.classList.toggle('auth-required',show);refreshIcons()}
 const refreshIcons=()=>document.querySelectorAll('[data-icon]').forEach(e=>e.innerHTML=icon(e.dataset.icon));
 const pendingReports=()=>reports.filter(r=>!['ดำเนินการแล้ว','ปิดเรื่อง'].includes(r.status));
 // Payment / refund modules are intentionally disabled until their separate scope is approved.
@@ -63,7 +61,7 @@ function loadSnapshot(data){reports=data.reports;users=data.users;transactions=d
 async function loadRemote(announce=false){try{const response=await fetch('/api/admin');if(response.status===401){connected=false;if(authState==='checking')showLogin(true);if(announce)toast('เข้าสู่ระบบเพื่อบันทึกข้อมูลถาวร','error');return}if(!response.ok)throw Error('โหลดข้อมูลไม่สำเร็จ');const result=await response.json();loadSnapshot(result.data);account=result.account;revision=result.revision;connected=true;showLogin(false);render();if(announce)toast('โหลดข้อมูลล่าสุดแล้ว')}catch{if(authState==='checking')showLogin(true);if(announce)toast('โหลดข้อมูลไม่สำเร็จ กรุณาลองอีกครั้ง','error')}}
 async function mutate(action){if(state.busy)throw Error('กำลังบันทึก กรุณารอสักครู่');state.busy=true;document.querySelectorAll('dialog button[type=submit],#confirm-submit').forEach(b=>b.disabled=true);try{if(connected){const response=await fetch('/api/admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,revision})});const result=await response.json();if(!response.ok){if(response.status===409)await loadRemote();throw Error(result.error||'บันทึกไม่สำเร็จ')}loadSnapshot(result.data);revision=result.revision}else{loadSnapshot(applyAction(snapshot(),action))}render();toast('บันทึกเรียบร้อยแล้ว');return {saved:connected}}finally{state.busy=false;document.querySelectorAll('dialog button[type=submit],#confirm-submit').forEach(b=>b.disabled=false)}}
 function confirm(title,message,handler){$('#confirm-title').textContent=title;$('#confirm-message').textContent=message;confirmHandler=handler;$('#confirm-dialog').showModal()}
-document.addEventListener('submit',async e=>{if(e.target.id!=='login-form')return;e.preventDefault();const form=e.target;const error=$('#login-error');error.textContent='';const identity=form.identity.value.trim();const password=form.password.value;if(!identity||!password){error.textContent='กรุณากรอก ชื่อผู้ใช้หรืออีเมลและรหัสผ่าน';return}try{const response=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({identity,password})});const data=await response.json().catch(()=>({}));if(!response.ok)throw Error(data.error||'เข้าสู่ระบบไม่สำเร็จ');await loadRemote()}catch{error.textContent='ยังไม่สามารถเชื่อมต่อ ระบบยืนยันตัวตน ได้ กรุณาลองใหม่หรือดูโหมดตัวอย่าง'}});
+document.addEventListener('submit',async e=>{if(e.target.id!=='login-form')return;e.preventDefault();const form=e.target;const error=$('#login-error');error.textContent='';const identity=form.identity.value.trim();const password=form.password.value;if(!identity||!password){error.textContent='กรุณากรอก ชื่อผู้ใช้หรืออีเมลและรหัสผ่าน';return}try{const response=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({identity,password})});const data=await response.json().catch(()=>({}));if(!response.ok)throw Error(data.error||'เข้าสู่ระบบไม่สำเร็จ');await loadRemote()}catch{error.textContent='ยังไม่สามารถเชื่อมต่อระบบยืนยันตัวตนได้ กรุณาลองใหม่'}});
 document.addEventListener('submit',async e=>{if(e.target.id!=='report-form')return;e.preventDefault();const form=e.target;const data=new FormData(form);const action={type:'report.update',id:currentRecord.id,status:data.get('status'),note:data.get('note'),notify:true};confirm('ยืนยันบันทึกผลรายงาน','ระบบจะส่งแจ้งผลไปยังผู้ใช้อัตโนมัติ',async()=>{try{await mutate(action);$('#detail-dialog').close()}catch(error){$('#form-error').textContent=error.message}})})
 document.addEventListener('click',async e=>{
  const r=e.target.closest('[data-report]');if(r)openReport(r.dataset.report);
@@ -81,7 +79,6 @@ document.addEventListener('click',async e=>{
  const period=e.target.closest('[data-period]');if(period){state.period=period.dataset.period;$('#detail-dialog').close();render()}
  if(a==='user-status'){const user=users.find(u=>u.id===currentRecord.id);const reason=$('#status-reason').value.trim();if(reason.length<5){toast('กรุณาระบุเหตุผลอย่างน้อย 5 ตัวอักษร','error');return}const status=user.status==='ระงับบัญชี'?'ใช้งานปกติ':'ระงับบัญชี';confirm(status==='ระงับบัญชี'?'ยืนยันระงับบัญชี':'ยืนยันเปิดใช้งานบัญชี',`${user.name} · ${reason}`,async()=>{await mutate({type:'user.status',id:user.id,status,reason,admin:account?.name||'Administrator'});$('#detail-dialog').close()})}
  if(a==='read-notifications'){try{await mutate({type:'notification.read'})}catch(error){toast(error.message,'error')}}
- if(a==='demo-login')showDemo();
  if(a==='export')exportCsv();
 });
 $('#confirm-submit').addEventListener('click',async()=>{if(!confirmHandler||state.busy)return;try{await confirmHandler();$('#confirm-dialog').close();confirmHandler=null}catch(error){toast(error.message,'error')}});
