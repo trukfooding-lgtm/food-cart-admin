@@ -18,3 +18,7 @@ services:
         sync: false
       - key: FOOD_CART_WEBHOOK_SECRET
         sync: false
+      - key: FOOD_CART_BACKEND_URL
+        sync: false
+      - key: FOOD_CART_ADMIN_SECRET
+        sync: false

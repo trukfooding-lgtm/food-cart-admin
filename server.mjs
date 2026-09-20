@@ -15,6 +15,8 @@ const sessionSecret = String(process.env.SESSION_SECRET || '');
 const supabaseUrl = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const supabasePublishableKey = String(process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || '');
 const webhookSecret = String(process.env.FOOD_CART_WEBHOOK_SECRET || '');
+const foodCartBackendUrl = String(process.env.FOOD_CART_BACKEND_URL || '').replace(/\/$/, '');
+const foodCartAdminSecret = String(process.env.FOOD_CART_ADMIN_SECRET || '');
 const adminId = `env:${email || 'administrator'}`;
 const workspaceId = 'standalone-admin';
 const pool = process.env.DATABASE_URL ? new Pool({connectionString: process.env.DATABASE_URL, ssl: {rejectUnauthorized: false}}) : null;
@@ -37,6 +39,38 @@ const issueSession = (loginEmail = email) => {
   const body = `${loginEmail}|${exp}`;
   return `${body}.${sign(body)}`;
 };
+
+async function syncAccountStatus(action, admin, eventId) {
+  if (!foodCartBackendUrl || !foodCartAdminSecret) throw new Error('ยังไม่ได้ตั้งค่าการเชื่อมต่อ Backend สำหรับสถานะบัญชี');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch(`${foodCartBackendUrl}/api/internal/account-status`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-foodcart-admin-secret': foodCartAdminSecret
+      },
+      body: JSON.stringify({
+        event_id: eventId,
+        user_id: action.id,
+        role: action.role,
+        status: action.status,
+        reason: action.reason.trim(),
+        changed_by: admin.name
+      }),
+      signal: controller.signal
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.success !== true) throw new Error(payload.message || 'Backend ไม่สามารถบันทึกสถานะบัญชีได้');
+    return payload;
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error('Backend ไม่ตอบสนองภายในเวลาที่กำหนด');
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 async function findAdmin(loginEmail) {
   const normalized = text(loginEmail).toLowerCase();
@@ -268,9 +302,13 @@ async function writeRelationalAction(action, revision, admin) {
     } else if (action?.type === 'user.status') {
       if (!can(admin, 'users')) throw Object.assign(new Error('ไม่มีสิทธิ์จัดการบัญชีผู้ใช้'), {code: 'FORBIDDEN'});
       if (!['ระงับบัญชี', 'ใช้งานปกติ'].includes(action.status) || !validText(action.reason, 5, 1000)) throw new Error('ข้อมูลสถานะบัญชีไม่ถูกต้อง');
+      const user = await client.query(`SELECT user_id, role FROM public.app_users WHERE user_id=$1 FOR UPDATE`, [action.id]);
+      if (!user.rows.length) throw new Error('ไม่พบบัญชี');
+      const eventId = crypto.randomUUID();
+      await syncAccountStatus({...action, role: user.rows[0].role}, admin, eventId);
       const result = await client.query(`UPDATE public.app_users SET status=$1, status_reason=$2, status_changed_by=$3, status_changed_at=now(), updated_at=now() WHERE user_id=$4 RETURNING user_id`, [action.status, action.reason.trim(), adminId, action.id]);
       if (!result.rows.length) throw new Error('ไม่พบบัญชี');
-      await recordAction(client, admin, action.status, 'user', action.id, action.reason.trim());
+      await recordAction(client, admin, action.status, 'user', action.id, action.reason.trim(), {event_id: eventId, backend_synced: true});
     } else if (action?.type === 'notification.read') {
       await client.query(`UPDATE public.notifications SET is_read=true, read_at=COALESCE(read_at, now()), updated_at=now() WHERE is_read=false`);
       await recordAction(client, admin, 'อ่านการแจ้งเตือนทั้งหมด', 'notification', 'all', 'ผู้ดูแลอ่านการแจ้งเตือน');
