@@ -22,3 +22,5 @@ services:
         sync: false
       - key: FOOD_CART_ADMIN_SECRET
         sync: false
+      - key: FOOD_CART_APP_DATABASE_URL
+        sync: false

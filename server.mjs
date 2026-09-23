@@ -17,9 +17,11 @@ const supabasePublishableKey = String(process.env.SUPABASE_PUBLISHABLE_KEY || pr
 const webhookSecret = String(process.env.FOOD_CART_WEBHOOK_SECRET || '');
 const foodCartBackendUrl = String(process.env.FOOD_CART_BACKEND_URL || '').replace(/\/$/, '');
 const foodCartAdminSecret = String(process.env.FOOD_CART_ADMIN_SECRET || '');
+const foodCartAppDatabaseUrl = String(process.env.FOOD_CART_APP_DATABASE_URL || '').trim();
 const adminId = `env:${email || 'administrator'}`;
 const workspaceId = 'standalone-admin';
 const pool = process.env.DATABASE_URL ? new Pool({connectionString: process.env.DATABASE_URL, ssl: {rejectUnauthorized: false}}) : null;
+const appPool = foodCartAppDatabaseUrl ? new Pool({connectionString: foodCartAppDatabaseUrl, ssl: {rejectUnauthorized: false}}) : null;
 let memory = {payload: normalizeSnapshot({}), revision: 0};
 
 app.use(express.json({limit: '256kb', verify: (req, _res, buf) => { req.rawBody = Buffer.from(buf); }}));
@@ -86,6 +88,76 @@ async function syncAccountStatus(action, admin, eventId) {
     throw error;
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+async function syncReportStatusToApp({reportId, reporterType, status, note, previousStatus}) {
+  if (previousStatus === status) return {changed: false, recipients: []};
+  if (!appPool) throw new Error('ยังไม่ได้ตั้งค่า FOOD_CART_APP_DATABASE_URL สำหรับส่งแจ้งเตือนไปยังลูกค้าและร้านค้า');
+
+  const numericReportId = Number(reportId);
+  if (!Number.isInteger(numericReportId)) throw new Error('รหัสรายงานไม่ถูกต้องสำหรับการส่งแจ้งเตือน');
+
+  const client = await appPool.connect();
+  try {
+    await client.query('BEGIN');
+    const preferredTables = reporterType === 'Shop'
+      ? ['merchant_issue_reports', 'app_issue_reports']
+      : ['app_issue_reports', 'merchant_issue_reports'];
+    let source = null;
+    for (const table of preferredTables) {
+      const result = table === 'app_issue_reports'
+        ? await client.query(`SELECT id, sender_type, customer_id, merchant_id, order_reference
+            FROM public.app_issue_reports WHERE id=$1 LIMIT 1`, [numericReportId])
+        : await client.query(`SELECT id, 'MERCHANT' AS sender_type, NULL::integer AS customer_id, merchant_id, order_reference
+            FROM public.merchant_issue_reports WHERE id=$1 LIMIT 1`, [numericReportId]);
+      if (result.rows[0]) { source = {table, ...result.rows[0]}; break; }
+    }
+    if (!source) throw new Error(`ไม่พบรายงาน #${reportId} ในฐานข้อมูลแอป`);
+
+    if (source.table === 'app_issue_reports') {
+      await client.query(`UPDATE public.app_issue_reports
+        SET status=$1, admin_note=$2, updated_at=now() WHERE id=$3`, [status, note.trim(), numericReportId]);
+    } else {
+      await client.query(`UPDATE public.merchant_issue_reports
+        SET status=$1, updated_at=now() WHERE id=$2`, [status, numericReportId]);
+    }
+
+    let customerId = source.customer_id == null ? null : Number(source.customer_id);
+    let merchantId = source.merchant_id == null ? null : Number(source.merchant_id);
+    if (source.order_reference) {
+      const order = await client.query(`SELECT customer_id, merchant_id
+        FROM public.orders WHERE id::text=$1 LIMIT 1`, [String(source.order_reference)]);
+      if (order.rows[0]) {
+        customerId ??= order.rows[0].customer_id == null ? null : Number(order.rows[0].customer_id);
+        merchantId ??= order.rows[0].merchant_id == null ? null : Number(order.rows[0].merchant_id);
+      }
+    }
+
+    const title = `รายงาน #${reportId} อัปเดตสถานะ`;
+    const body = `แอดมินเปลี่ยนสถานะรายงานเป็น “${status}”${note.trim() ? `\n${note.trim()}` : ''}`;
+    const recipients = [];
+    if (customerId != null) {
+      await client.query(`INSERT INTO public.notifications (user_id, title, body)
+        VALUES ($1,$2,$3)`, [customerId, title, body]);
+      recipients.push(`customer:${customerId}`);
+    }
+    if (merchantId != null) {
+      const sourceId = `report:${reportId}:status:${status}`;
+      await client.query(`INSERT INTO public.merchant_notifications
+        (merchant_id, source_type, source_id, title, message, event_at)
+        VALUES ($1,'report_status',$2,$3,$4,now())
+        ON CONFLICT (merchant_id, source_type, source_id) DO NOTHING`,
+      [merchantId, sourceId, title, body]);
+      recipients.push(`merchant:${merchantId}`);
+    }
+    await client.query('COMMIT');
+    return {changed: true, recipients};
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
   }
 }
 
@@ -187,7 +259,7 @@ function normalizeSupabaseWebhook(payload) {
     shop_name: row.shop_name || row.merchant_name,
     reporter_type: String(row.sender_type || '').toUpperCase() === 'MERCHANT' ? 'Shop' : 'Customer',
     issue_type: row.issue_type, order_id: row.order_reference,
-    note: row.details, status: row.status, created_at: row.created_at, source_updated_at: updatedAt,
+    note: row.admin_note || row.details, status: row.status, created_at: row.created_at, source_updated_at: updatedAt,
     evidence_urls: normalizeEvidenceUrls(row.image_url),
     evidence_count: normalizeEvidenceUrls(row.image_url).length
   }};
@@ -328,8 +400,11 @@ async function writeRelationalAction(action, revision, admin) {
     if (action?.type === 'report.update') {
       if (!can(admin, 'reports')) throw Object.assign(new Error('ไม่มีสิทธิ์แก้ไขรายงาน'), {code: 'FORBIDDEN'});
       if (!['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(action.status) || !validText(action.note, 5, 2000)) throw new Error('ข้อมูลรายงานไม่ถูกต้อง');
-      const result = await client.query(`UPDATE public.reports SET status=$1, note=$2, updated_at=now() WHERE report_id=$3 RETURNING reporter_id, priority`, [action.status, action.note.trim(), action.id]);
+      const existing = await client.query(`SELECT status, reporter_type FROM public.reports WHERE report_id=$1 FOR UPDATE`, [action.id]);
+      if (!existing.rows.length) throw new Error('ไม่พบรายงาน');
+      const result = await client.query(`UPDATE public.reports SET status=$1, note=$2, updated_at=now() WHERE report_id=$3 RETURNING reporter_id, reporter_type, priority`, [action.status, action.note.trim(), action.id]);
       if (!result.rows.length) throw new Error('ไม่พบรายงาน');
+      if (action.notify === true) await syncReportStatusToApp({reportId: action.id, reporterType: result.rows[0].reporter_type || existing.rows[0].reporter_type, status: action.status, note: action.note, previousStatus: existing.rows[0].status});
       if (action.notify === true) await client.query(`INSERT INTO public.notifications (notification_id, recipient_id, source_type, source_id, title, body, priority, delivery_status) VALUES ($1,$2,'report',$3,$4,$5,$6,'รอส่ง')`, [crypto.randomUUID(), result.rows[0].reporter_id || null, action.id, `รายงาน #${action.id} อัปเดตแล้ว`, action.note.trim(), result.rows[0].priority || 'ปกติ']);
       await recordAction(client, admin, `อัปเดต Report เป็น ${action.status}`, 'report', action.id, action.note);
     } else if (action?.type === 'user.status') {

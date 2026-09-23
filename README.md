@@ -22,9 +22,11 @@ ADMIN_PASSWORD_HASH=แฮชรหัสผ่าน (ใช้แทน ADMIN_
 SUPABASE_URL=URL ของโปรเจกต์ Supabase Admin
 SUPABASE_PUBLISHABLE_KEY=Publishable key ของโปรเจกต์ Supabase Admin
 FOOD_CART_WEBHOOK_SECRET=ข้อความลับสำหรับตรวจสอบ Webhook จากแอปหลัก
+FOOD_CART_APP_DATABASE_URL=ลิงก์เชื่อมต่อ PostgreSQL ของฐานข้อมูลแอปหลัก
 ```
 
 `DATABASE_URL` ใช้เฉพาะฝั่งเซิร์ฟเวอร์ ไม่ถูกส่งไปยังเบราว์เซอร์
+`FOOD_CART_APP_DATABASE_URL` ใช้เฉพาะตอนบันทึกสถานะรายงาน เพื่ออัปเดตสถานะต้นทางและเพิ่มแจ้งเตือนในฐานข้อมูลแอปหลัก โดยควรใช้ค่าเดียวกับ `DATABASE_URL` ของ Backend แอปหลัก
 
 ## ตรวจสอบการทำงาน
 
