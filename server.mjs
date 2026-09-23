@@ -33,8 +33,15 @@ const now = () => new Date().toISOString();
 const text = (value, fallback = '') => String(value ?? fallback).trim();
 const validText = (value, min, max) => typeof value === 'string' && value.trim().length >= min && value.trim().length <= max;
 const safeDate = (value) => value ? new Date(value) : new Date();
-const displayTime = (value) => safeDate(value).toLocaleTimeString('th-TH', {hour: '2-digit', minute: '2-digit'});
+const reportTimeZone = 'Asia/Bangkok';
+const displayTime = (value) => safeDate(value).toLocaleTimeString('th-TH', {timeZone: reportTimeZone, hour: '2-digit', minute: '2-digit', hour12: false});
 const displayDate = (value) => safeDate(value).toLocaleDateString('th-TH', {day: 'numeric', month: 'short', year: 'numeric'});
+const displayDateTime = (value) => {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return `${date.toLocaleDateString('th-TH', {timeZone: reportTimeZone, day: 'numeric', month: 'short', year: 'numeric'})} · ${date.toLocaleTimeString('th-TH', {timeZone: reportTimeZone, hour: '2-digit', minute: '2-digit', hour12: false})}`;
+};
 const normalizeEvidenceUrls = (value) => {
   let values = value;
   if (typeof values === 'string') {
@@ -313,6 +320,7 @@ function mapReport(row) {
     status: row.status,
     priority: row.priority,
     time: displayTime(row.created_at),
+    reportedAt: displayDateTime(row.created_at),
     userId: row.reporter_id || '',
     note: row.note || '',
     evidenceCount: Number(row.evidence_count || 0),
@@ -334,7 +342,8 @@ function mapNotification(row) {
     sourceType: row.source_type || '',
     sourceId: row.source_id || '',
     reporterType: row.reporter_type || '',
-    reporterName: row.reporter_name || row.shop_name || ''
+    reporterName: row.reporter_name || row.shop_name || '',
+    reportedAt: row.report_created_at ? displayDateTime(row.report_created_at) : ''
   };
 }
 
@@ -374,7 +383,7 @@ async function snapshotFrom(client) {
   const [users, reports, notifications, history, workspace] = await Promise.all([
     client.query('SELECT * FROM public.app_users ORDER BY created_at, user_id'),
     client.query('SELECT * FROM public.reports ORDER BY created_at DESC, report_id'),
-    client.query(`SELECT n.*, r.reporter_type, r.reporter_name, r.shop_name
+    client.query(`SELECT n.*, r.reporter_type, r.reporter_name, r.shop_name, r.created_at AS report_created_at
       FROM public.notifications n
       INNER JOIN public.reports r
         ON r.report_id = n.source_id
