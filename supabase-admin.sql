@@ -91,9 +91,14 @@ create table if not exists public.reports (
   priority text not null default 'ปกติ' check (priority in ('สูงสุด', 'สูง', 'ปกติ', 'ต่ำ')),
   note text not null default '',
   evidence_count integer not null default 0 check (evidence_count >= 0),
+  evidence_urls jsonb not null default '[]'::jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+-- เก็บ URL หลักฐานจริงจากรายงานเดิมโดยไม่กระทบข้อมูลเดิม
+alter table public.reports
+  add column if not exists evidence_urls jsonb not null default '[]'::jsonb;
 
 create table if not exists public.notifications (
   notification_id text primary key,
