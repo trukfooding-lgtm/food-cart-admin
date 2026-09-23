@@ -15,7 +15,7 @@ export function applyAction(input,action){
  // Payment / refund operations are intentionally disabled until a separate scope is approved.
  }else if(action.type==='refund.note'||String(action.type||'').startsWith('payment')){
   throw Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
- }else if(action.type==='notification.read'){next.notifications.forEach(n=>{n.read=true});return next;
+ }else if(action.type==='notification.read'){if(action.id){next.notifications.forEach(n=>{if(String(n.id)===String(action.id))n.read=true})}else next.notifications.forEach(n=>{n.read=true});return next;
  }else throw Error('ไม่รองรับการดำเนินการนี้');
  next.history.unshift({id:crypto.randomUUID(),action:audit,target,time:now});return next;
 }

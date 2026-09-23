@@ -330,7 +330,11 @@ function mapNotification(row) {
     priority: row.priority,
     read: Boolean(row.is_read),
     recipient: row.recipient_id || '',
-    delivery: row.delivery_status
+    delivery: row.delivery_status,
+    sourceType: row.source_type || '',
+    sourceId: row.source_id || '',
+    reporterType: row.reporter_type || '',
+    reporterName: row.reporter_name || row.shop_name || ''
   };
 }
 
@@ -370,7 +374,12 @@ async function snapshotFrom(client) {
   const [users, reports, notifications, history, workspace] = await Promise.all([
     client.query('SELECT * FROM public.app_users ORDER BY created_at, user_id'),
     client.query('SELECT * FROM public.reports ORDER BY created_at DESC, report_id'),
-    client.query('SELECT * FROM public.notifications ORDER BY created_at DESC, notification_id'),
+    client.query(`SELECT n.*, r.reporter_type, r.reporter_name, r.shop_name
+      FROM public.notifications n
+      INNER JOIN public.reports r
+        ON r.report_id = n.source_id
+      WHERE n.source_type = 'report'
+      ORDER BY n.created_at DESC, n.notification_id`),
     client.query('SELECT action_id, action_type, target_id, created_at FROM public.admin_actions ORDER BY created_at DESC LIMIT 200'),
     client.query('SELECT revision FROM public.admin_workspaces WHERE user_id = $1', [workspaceId])
   ]);
@@ -418,8 +427,14 @@ async function writeRelationalAction(action, revision, admin) {
       if (!result.rows.length) throw new Error('ไม่พบบัญชี');
       await recordAction(client, admin, action.status, 'user', action.id, action.reason.trim(), {event_id: eventId, backend_synced: true});
     } else if (action?.type === 'notification.read') {
-      await client.query(`UPDATE public.notifications SET is_read=true, read_at=COALESCE(read_at, now()), updated_at=now() WHERE is_read=false`);
-      await recordAction(client, admin, 'อ่านการแจ้งเตือนทั้งหมด', 'notification', 'all', 'ผู้ดูแลอ่านการแจ้งเตือน');
+      if (action.id) {
+        await client.query(`UPDATE public.notifications SET is_read=true, read_at=COALESCE(read_at, now()), updated_at=now()
+          WHERE notification_id=$1 AND is_read=false`, [String(action.id)]);
+        await recordAction(client, admin, 'อ่านการแจ้งเตือน', 'notification', String(action.id), 'ผู้ดูแลเปิดดูการแจ้งเตือน');
+      } else {
+        await client.query(`UPDATE public.notifications SET is_read=true, read_at=COALESCE(read_at, now()), updated_at=now() WHERE is_read=false`);
+        await recordAction(client, admin, 'อ่านการแจ้งเตือนทั้งหมด', 'notification', 'all', 'ผู้ดูแลอ่านการแจ้งเตือน');
+      }
     } else if (String(action?.type || '').startsWith('refund') || String(action?.type || '').startsWith('payment')) {
       throw new Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
     } else {
