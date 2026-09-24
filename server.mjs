@@ -212,6 +212,11 @@ const suspensionMarkers = Object.freeze({
   merchantNotRefunded: '[ยืนยันไม่คืนเงิน]',
   merchantRefunded: '[ยืนยันคืนเงินแล้ว]'
 });
+const suspensionPolicies = Object.freeze({
+  fake_slip: {roles: ['Customer'], permanent: true},
+  merchant_no_refund: {roles: ['Shop'], permanent: true},
+  inappropriate_behavior: {roles: ['Customer', 'Shop'], temporary: true}
+});
 const completedReportStatuses = new Set(['ดำเนินการแล้ว', 'ปิดเรื่อง']);
 
 function externalUserId(userId) {
@@ -229,7 +234,7 @@ function hasOnlyMarker(note, marker) {
   return markers.length === 1 && markers[0] === marker;
 }
 
-async function findSuspensionEvidence(client, user) {
+async function findSuspensionEvidence(client, user, reasonType) {
   const targetId = externalUserId(user.user_id);
   const isShop = user.role === 'Shop';
   const reporterType = isShop ? 'Customer' : 'Shop';
@@ -251,13 +256,38 @@ async function findSuspensionEvidence(client, user) {
     ORDER BY r.updated_at DESC, r.created_at DESC
   `, [Array.from(completedReportStatuses), reporterType, user.role, targetId]);
 
-  const evidence = result.rows.find((row) => hasReportEvidence(row) && hasOnlyMarker(text(row.note), marker));
+  const evidence = result.rows.find((row) => reasonType === 'inappropriate_behavior'
+    ? true
+    : hasReportEvidence(row) && hasOnlyMarker(text(row.note), marker));
   if (evidence) return evidence;
 
+  if (reasonType === 'inappropriate_behavior') {
+    throw new Error('ยังระงับบัญชีไม่ได้ ต้องมีรายงานพฤติกรรมที่ตรวจสอบแล้วและเชื่อมโยงกับคำสั่งซื้อ');
+  }
   if (isShop) {
     throw new Error('ยังระงับร้านค้าไม่ได้ ต้องมีรายงานลูกค้าที่ตรวจสอบแล้ว ระบุ [ยืนยันไม่คืนเงิน] พร้อมเลขออเดอร์และหลักฐาน');
   }
   throw new Error('ยังระงับลูกค้าไม่ได้ ต้องมีรายงานจากร้านค้าที่ตรวจสอบแล้ว ระบุ [ยืนยันสลิปปลอม] พร้อมเลขออเดอร์และหลักฐาน');
+}
+
+function buildSuspensionPlan(action, user) {
+  const policy = suspensionPolicies[text(action.reasonType)];
+  if (!policy || !policy.roles.includes(user.role)) throw new Error('ประเภทเหตุผลไม่ตรงกับประเภทบัญชี');
+  const reason = text(action.reason);
+  if (!validText(reason, 5, 1000)) throw new Error('เหตุผลบัญชีไม่ถูกต้อง');
+  if (policy.temporary) {
+    const durationDays = Number(action.durationDays);
+    if (![7, 30].includes(durationDays)) throw new Error('การระงับพฤติกรรมต้องเลือก 7 วันหรือ 30 วัน');
+    const until = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000);
+    return {
+      reasonType: text(action.reasonType),
+      durationDays,
+      until: until.toISOString(),
+      effectiveReason: `${reason}\nระงับชั่วคราวถึง: ${displayDateTime(until)}`
+    };
+  }
+  if (action.durationDays != null) throw new Error('กรณีนี้ต้องเป็นการระงับโดยไม่มีกำหนด');
+  return {reasonType: text(action.reasonType), durationDays: null, until: null, effectiveReason: reason};
 }
 
 function requireWebhook(req, res, next) {
@@ -350,6 +380,8 @@ function mapUser(row) {
     role: row.role,
     status: row.status,
     reason: row.status_reason || '',
+    suspensionUntil: row.suspension_until || '',
+    suspensionReasonType: row.suspension_reason_type || '',
     joined: row.joined_at ? displayDate(row.joined_at) : '',
     shop: row.shop_name || '—',
     phone: row.phone || '',
@@ -434,7 +466,17 @@ async function ensureDb() {
 
 async function snapshotFrom(client) {
   const [users, reports, notifications, history, workspace] = await Promise.all([
-    client.query('SELECT * FROM public.app_users ORDER BY created_at, user_id'),
+    client.query(`SELECT u.*, latest.metadata->>'suspension_until' AS suspension_until,
+        latest.metadata->>'suspension_reason_type' AS suspension_reason_type
+      FROM public.app_users u
+      LEFT JOIN LATERAL (
+        SELECT a.action_type, a.metadata
+        FROM public.admin_actions a
+        WHERE a.target_type='user' AND a.target_id=u.user_id
+        ORDER BY a.created_at DESC, a.action_id DESC
+        LIMIT 1
+      ) latest ON latest.action_type='ระงับบัญชี' AND u.status='ระงับบัญชี'
+      ORDER BY u.created_at, u.user_id`),
     client.query('SELECT * FROM public.reports ORDER BY created_at DESC, report_id'),
     client.query(`SELECT n.*, r.reporter_type, r.reporter_name, r.shop_name, r.created_at AS report_created_at
       FROM public.notifications n
@@ -483,16 +525,21 @@ async function writeRelationalAction(action, revision, admin) {
       if (!['ระงับบัญชี', 'ใช้งานปกติ'].includes(action.status) || !validText(action.reason, 5, 1000)) throw new Error('ข้อมูลสถานะบัญชีไม่ถูกต้อง');
       const user = await client.query(`SELECT user_id, role FROM public.app_users WHERE user_id=$1 FOR UPDATE`, [action.id]);
       if (!user.rows.length) throw new Error('ไม่พบบัญชี');
+      const suspensionPlan = action.status === 'ระงับบัญชี'
+        ? buildSuspensionPlan(action, user.rows[0])
+        : {reasonType: 'lift_suspension', durationDays: null, until: null, effectiveReason: action.reason.trim()};
       const suspensionEvidence = action.status === 'ระงับบัญชี'
-        ? await findSuspensionEvidence(client, user.rows[0])
+        ? await findSuspensionEvidence(client, user.rows[0], suspensionPlan.reasonType)
         : null;
       const eventId = crypto.randomUUID();
-      await syncAccountStatus({...action, role: user.rows[0].role}, admin, eventId);
-      const result = await client.query(`UPDATE public.app_users SET status=$1, status_reason=$2, status_changed_by=$3, status_changed_at=now(), updated_at=now() WHERE user_id=$4 RETURNING user_id`, [action.status, action.reason.trim(), adminId, action.id]);
+      await syncAccountStatus({...action, role: user.rows[0].role, reason: suspensionPlan.effectiveReason}, admin, eventId);
+      const result = await client.query(`UPDATE public.app_users SET status=$1, status_reason=$2, status_changed_by=$3, status_changed_at=now(), updated_at=now() WHERE user_id=$4 RETURNING user_id`, [action.status, suspensionPlan.effectiveReason, adminId, action.id]);
       if (!result.rows.length) throw new Error('ไม่พบบัญชี');
-      await recordAction(client, admin, action.status, 'user', action.id, action.reason.trim(), {
+      await recordAction(client, admin, action.status, 'user', action.id, suspensionPlan.effectiveReason, {
         event_id: eventId,
         backend_synced: true,
+        suspension_reason_type: suspensionPlan.reasonType,
+        ...(suspensionPlan.until ? {suspension_until: suspensionPlan.until, suspension_duration_days: suspensionPlan.durationDays} : {}),
         ...(suspensionEvidence ? {suspension_report_id: suspensionEvidence.report_id} : {})
       });
     } else if (action?.type === 'notification.read') {
@@ -519,6 +566,61 @@ async function writeRelationalAction(action, revision, admin) {
     await client.query('ROLLBACK').catch(() => {});
     throw error;
   } finally { client.release(); }
+}
+
+async function releaseExpiredSuspensions() {
+  if (!pool || !foodCartBackendUrl || !foodCartAdminSecret) return;
+  const client = await pool.connect();
+  try {
+    const result = await client.query(`
+      SELECT u.user_id, u.role, latest.metadata->>'suspension_until' AS suspension_until
+      FROM public.app_users u
+      JOIN LATERAL (
+        SELECT a.action_type, a.metadata
+        FROM public.admin_actions a
+        WHERE a.target_type='user' AND a.target_id=u.user_id
+        ORDER BY a.created_at DESC, a.action_id DESC
+        LIMIT 1
+      ) latest ON true
+      WHERE u.status='ระงับบัญชี'
+        AND latest.action_type='ระงับบัญชี'
+        AND (latest.metadata->>'suspension_until') IS NOT NULL
+        AND (latest.metadata->>'suspension_until')::timestamptz <= now()
+    `);
+
+    for (const row of result.rows) {
+      const eventId = crypto.randomUUID();
+      const reason = `ครบกำหนดการระงับบัญชีชั่วคราว (${displayDateTime(row.suspension_until)})`;
+      try {
+        await syncAccountStatus({
+          id: row.user_id,
+          role: row.role,
+          status: 'ใช้งานปกติ',
+          reason
+        }, {name: 'ระบบ Admin'}, eventId);
+        await client.query('BEGIN');
+        const updated = await client.query(`UPDATE public.app_users
+          SET status='ใช้งานปกติ', status_reason=$1, status_changed_by=$2,
+              status_changed_at=now(), updated_at=now()
+          WHERE user_id=$3 AND status='ระงับบัญชี'
+          RETURNING user_id`, [reason, adminId, row.user_id]);
+        if (updated.rows.length) {
+          await recordAction(client, {id: adminId}, 'ใช้งานปกติ', 'user', row.user_id, reason, {
+            event_id: eventId,
+            backend_synced: true,
+            automatic_expiry: true
+          });
+          await client.query(`UPDATE public.admin_workspaces SET revision=revision+1 WHERE user_id=$1`, [workspaceId]);
+        }
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error(`Automatic suspension expiry failed for ${row.user_id}:`, error.message);
+      }
+    }
+  } finally {
+    client.release();
+  }
 }
 
 async function handleIntegrationEvent(event) {
@@ -589,7 +691,11 @@ app.post('/api/integration/supabase-webhook', requireWebhook, async (req, res) =
 });
 
 app.get('/api/admin', requireAdmin, async (_req, res) => {
-  try { const workspace = await readWorkspace(); return json(res, {data: workspace.data || workspace.payload, revision: workspace.revision, account: {name: process.env.ADMIN_NAME || 'ผู้ดูแลระบบ', email}}); }
+  try {
+    await releaseExpiredSuspensions();
+    const workspace = await readWorkspace();
+    return json(res, {data: workspace.data || workspace.payload, revision: workspace.revision, account: {name: process.env.ADMIN_NAME || 'ผู้ดูแลระบบ', email}});
+  }
   catch (error) { console.error(error); return json(res, {error: 'ไม่สามารถโหลดข้อมูลได้'}, 503); }
 });
 
@@ -613,6 +719,8 @@ app.post('/api/admin', requireAdmin, async (req, res) => {
 });
 
 app.get('*', (_req, res) => res.sendFile('admin.html', {root: 'public'}));
+const suspensionExpiryTimer = setInterval(() => releaseExpiredSuspensions().catch((error) => console.error('Suspension expiry check failed:', error.message)), 60 * 1000);
+suspensionExpiryTimer.unref?.();
 ensureDb().then(() => app.listen(port, () => console.log(`Foot cart Admin listening on ${port}`))).catch((error) => {
   console.error('Database initialization failed:', error.message);
   app.listen(port, () => console.log(`Foot cart Admin listening on ${port} without database`));
