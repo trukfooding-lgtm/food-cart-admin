@@ -394,9 +394,9 @@ function mapUser(row) {
   };
 }
 
-function mapReport(row, sourceEvidenceUrls = []) {
+function mapReport(row, sourceReport = {}, reviewNote = '') {
   const storedEvidenceUrls = normalizeEvidenceUrls(row.evidence_urls);
-  const evidenceUrls = storedEvidenceUrls.length ? storedEvidenceUrls : normalizeEvidenceUrls(sourceEvidenceUrls);
+  const evidenceUrls = storedEvidenceUrls.length ? storedEvidenceUrls : normalizeEvidenceUrls(sourceReport.evidenceUrls);
   return {
     id: row.report_id,
     name: row.title,
@@ -410,30 +410,36 @@ function mapReport(row, sourceEvidenceUrls = []) {
     time: displayTime(row.created_at),
     reportedAt: displayDateTime(row.created_at),
     userId: row.reporter_id || '',
-    note: row.note || '',
+    note: text(reviewNote) || row.note || '',
+    originalDetails: text(sourceReport.details) || (reviewNote ? '' : text(row.note)),
+    reviewNote: text(reviewNote),
     evidenceCount: Math.max(Number(row.evidence_count || 0), evidenceUrls.length),
     evidenceUrls,
     updatedAt: row.updated_at
   };
 }
 
-async function sourceReportEvidence(reportRows) {
+async function sourceReportData(reportRows) {
   if (!appPool) return new Map();
   const ids = reportRows.map((row) => Number(row.report_id)).filter((id) => Number.isInteger(id));
   if (!ids.length) return new Map();
-  const evidence = new Map();
+  const sourceReports = new Map();
   for (const table of ['app_issue_reports', 'merchant_issue_reports']) {
     try {
-      const result = await appPool.query(`SELECT id, image_url FROM public.${table} WHERE id = ANY($1::int[]) AND image_url IS NOT NULL`, [ids]);
+      const result = await appPool.query(`SELECT id, image_url, details FROM public.${table} WHERE id = ANY($1::int[])`, [ids]);
       for (const row of result.rows) {
         const urls = normalizeEvidenceUrls(row.image_url);
-        if (urls.length) evidence.set(String(row.id), urls);
+        const previous = sourceReports.get(String(row.id)) || {};
+        sourceReports.set(String(row.id), {
+          evidenceUrls: urls.length ? urls : previous.evidenceUrls || [],
+          details: text(row.details) || previous.details || ''
+        });
       }
     } catch (error) {
-      console.warn(`ไม่สามารถอ่านหลักฐานจาก ${table}:`, error.message);
+      console.warn(`ไม่สามารถอ่านข้อมูลรายงานจาก ${table}:`, error.message);
     }
   }
-  return evidence;
+  return sourceReports;
 }
 
 function mapNotification(row) {
@@ -455,7 +461,7 @@ function mapNotification(row) {
 }
 
 function mapHistory(row) {
-  return {id: row.action_id, action: row.action_type, target: row.target_id, time: row.created_at};
+  return {id: row.action_id, action: row.action_type, target: row.target_id, reason: row.reason || '', time: row.created_at};
 }
 
 async function readSchema() {
@@ -487,7 +493,7 @@ async function ensureDb() {
 }
 
 async function snapshotFrom(client) {
-  const [users, reports, notifications, history, workspace] = await Promise.all([
+  const [users, reports, notifications, history, reportReviews, workspace] = await Promise.all([
     client.query(`SELECT u.*, latest.metadata->>'suspension_until' AS suspension_until,
         latest.metadata->>'suspension_reason_type' AS suspension_reason_type
       FROM public.app_users u
@@ -506,12 +512,21 @@ async function snapshotFrom(client) {
         ON r.report_id = n.source_id
       WHERE n.source_type = 'report'
       ORDER BY n.created_at DESC, n.notification_id`),
-    client.query('SELECT action_id, action_type, target_id, created_at FROM public.admin_actions ORDER BY created_at DESC LIMIT 200'),
+    client.query('SELECT action_id, action_type, target_type, target_id, reason, created_at FROM public.admin_actions ORDER BY created_at DESC LIMIT 200'),
+    client.query(`SELECT target_id, reason FROM public.admin_actions
+      WHERE target_type='report' AND action_type LIKE 'อัปเดต Report%' AND reason IS NOT NULL
+      ORDER BY created_at DESC, action_id DESC`),
     client.query('SELECT revision FROM public.admin_workspaces WHERE user_id = $1', [workspaceId])
   ]);
-  const sourceEvidence = await sourceReportEvidence(reports.rows);
+  const sourceReports = await sourceReportData(reports.rows);
+  const reviewNotes = new Map();
+  for (const row of reportReviews.rows) {
+    if (text(row.reason) && !reviewNotes.has(String(row.target_id))) {
+      reviewNotes.set(String(row.target_id), text(row.reason));
+    }
+  }
   return {
-    data: {users: users.rows.map(mapUser), reports: reports.rows.map((row) => mapReport(row, sourceEvidence.get(String(row.report_id)) || [])), notifications: notifications.rows.map(mapNotification), history: history.rows.map(mapHistory), transactions: []},
+    data: {users: users.rows.map(mapUser), reports: reports.rows.map((row) => mapReport(row, sourceReports.get(String(row.report_id)) || {}, reviewNotes.get(String(row.report_id)) || '')), notifications: notifications.rows.map(mapNotification), history: history.rows.map(mapHistory), transactions: []},
     revision: Number(workspace.rows[0]?.revision || 0)
   };
 }
@@ -538,7 +553,7 @@ async function writeRelationalAction(action, revision, admin) {
       if (!['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(action.status) || !validText(action.note, 5, 2000)) throw new Error('ข้อมูลรายงานไม่ถูกต้อง');
       const existing = await client.query(`SELECT status, reporter_type FROM public.reports WHERE report_id=$1 FOR UPDATE`, [action.id]);
       if (!existing.rows.length) throw new Error('ไม่พบรายงาน');
-      const result = await client.query(`UPDATE public.reports SET status=$1, note=$2, updated_at=now() WHERE report_id=$3 RETURNING reporter_id, reporter_type, priority`, [action.status, action.note.trim(), action.id]);
+      const result = await client.query(`UPDATE public.reports SET status=$1, updated_at=now() WHERE report_id=$2 RETURNING reporter_id, reporter_type, priority`, [action.status, action.id]);
       if (!result.rows.length) throw new Error('ไม่พบรายงาน');
       if (action.notify === true) await syncReportStatusToApp({reportId: action.id, reporterType: result.rows[0].reporter_type || existing.rows[0].reporter_type, status: action.status, note: action.note, previousStatus: existing.rows[0].status});
       if (action.notify === true) await client.query(`INSERT INTO public.notifications (notification_id, recipient_id, source_type, source_id, title, body, priority, delivery_status) VALUES ($1,$2,'report',$3,$4,$5,$6,'รอส่ง')`, [crypto.randomUUID(), result.rows[0].reporter_id || null, action.id, `รายงาน #${action.id} อัปเดตแล้ว`, action.note.trim(), result.rows[0].priority || 'ปกติ']);
