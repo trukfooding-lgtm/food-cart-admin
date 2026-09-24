@@ -207,6 +207,59 @@ async function requireAdmin(req, res, next) {
 
 const can = (admin, permission) => admin?.role === 'super_admin' || (permission === 'reports' && admin?.role === 'reviewer') || (permission === 'users' && admin?.role === 'user_manager');
 
+const suspensionMarkers = Object.freeze({
+  fakeSlip: '[ยืนยันสลิปปลอม]',
+  merchantNotRefunded: '[ยืนยันไม่คืนเงิน]',
+  merchantRefunded: '[ยืนยันคืนเงินแล้ว]'
+});
+const completedReportStatuses = new Set(['ดำเนินการแล้ว', 'ปิดเรื่อง']);
+
+function externalUserId(userId) {
+  const value = text(userId);
+  const separator = value.indexOf(':');
+  return separator >= 0 ? value.slice(separator + 1) : value;
+}
+
+function hasReportEvidence(row) {
+  return Number(row.evidence_count || 0) > 0 || normalizeEvidenceUrls(row.evidence_urls).length > 0;
+}
+
+function hasOnlyMarker(note, marker) {
+  const markers = Object.values(suspensionMarkers).filter((value) => note.includes(value));
+  return markers.length === 1 && markers[0] === marker;
+}
+
+async function findSuspensionEvidence(client, user) {
+  const targetId = externalUserId(user.user_id);
+  const isShop = user.role === 'Shop';
+  const reporterType = isShop ? 'Customer' : 'Shop';
+  const marker = isShop ? suspensionMarkers.merchantNotRefunded : suspensionMarkers.fakeSlip;
+  const result = await client.query(`
+    SELECT r.report_id, r.status, r.note, r.order_id, r.evidence_count, r.evidence_urls,
+           r.reporter_type, o.customer_id, o.merchant_id
+    FROM public.reports r
+    LEFT JOIN public.app_orders o
+      ON o.order_id = r.order_id
+      OR o.order_id = regexp_replace(r.order_id, '^ORD-', '')
+    WHERE r.status = ANY($1::text[])
+      AND r.reporter_type = $2
+      AND r.order_id IS NOT NULL
+      AND (
+        ($3 = 'Shop' AND o.merchant_id::text = $4)
+        OR ($3 = 'Customer' AND o.customer_id::text = $4)
+      )
+    ORDER BY r.updated_at DESC, r.created_at DESC
+  `, [Array.from(completedReportStatuses), reporterType, user.role, targetId]);
+
+  const evidence = result.rows.find((row) => hasReportEvidence(row) && hasOnlyMarker(text(row.note), marker));
+  if (evidence) return evidence;
+
+  if (isShop) {
+    throw new Error('ยังระงับร้านค้าไม่ได้ ต้องมีรายงานลูกค้าที่ตรวจสอบแล้ว ระบุ [ยืนยันไม่คืนเงิน] พร้อมเลขออเดอร์และหลักฐาน');
+  }
+  throw new Error('ยังระงับลูกค้าไม่ได้ ต้องมีรายงานจากร้านค้าที่ตรวจสอบแล้ว ระบุ [ยืนยันสลิปปลอม] พร้อมเลขออเดอร์และหลักฐาน');
+}
+
 function requireWebhook(req, res, next) {
   if (!webhookSecret) return json(res, {error: 'ยังไม่ได้ตั้งค่า FOOD_CART_WEBHOOK_SECRET'}, 503);
   const directSecret = String(req.get('x-foodcart-webhook-secret') || '').trim();
@@ -430,11 +483,18 @@ async function writeRelationalAction(action, revision, admin) {
       if (!['ระงับบัญชี', 'ใช้งานปกติ'].includes(action.status) || !validText(action.reason, 5, 1000)) throw new Error('ข้อมูลสถานะบัญชีไม่ถูกต้อง');
       const user = await client.query(`SELECT user_id, role FROM public.app_users WHERE user_id=$1 FOR UPDATE`, [action.id]);
       if (!user.rows.length) throw new Error('ไม่พบบัญชี');
+      const suspensionEvidence = action.status === 'ระงับบัญชี'
+        ? await findSuspensionEvidence(client, user.rows[0])
+        : null;
       const eventId = crypto.randomUUID();
       await syncAccountStatus({...action, role: user.rows[0].role}, admin, eventId);
       const result = await client.query(`UPDATE public.app_users SET status=$1, status_reason=$2, status_changed_by=$3, status_changed_at=now(), updated_at=now() WHERE user_id=$4 RETURNING user_id`, [action.status, action.reason.trim(), adminId, action.id]);
       if (!result.rows.length) throw new Error('ไม่พบบัญชี');
-      await recordAction(client, admin, action.status, 'user', action.id, action.reason.trim(), {event_id: eventId, backend_synced: true});
+      await recordAction(client, admin, action.status, 'user', action.id, action.reason.trim(), {
+        event_id: eventId,
+        backend_synced: true,
+        ...(suspensionEvidence ? {suspension_report_id: suspensionEvidence.report_id} : {})
+      });
     } else if (action?.type === 'notification.read') {
       if (action.id) {
         await client.query(`UPDATE public.notifications SET is_read=true, read_at=COALESCE(read_at, now()), updated_at=now()
