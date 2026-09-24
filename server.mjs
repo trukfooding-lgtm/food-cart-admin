@@ -57,7 +57,8 @@ const normalizeEvidenceUrls = (value) => {
   if (!Array.isArray(values)) values = values == null ? [] : [values];
   return values
     .map((item) => text(item))
-    .filter((url) => /^(https?:\/\/|\/)/i.test(url));
+    .filter((url) => /^(https?:\/\/|\/)/i.test(url))
+    .map((url) => /^\//.test(url) && foodCartBackendUrl ? `${foodCartBackendUrl}${url}` : url);
 };
 const sign = (value, secret = sessionSecret || 'development-only-secret') => crypto.createHmac('sha256', secret).update(value).digest('base64url');
 const issueSession = (loginEmail = email) => {
@@ -393,7 +394,9 @@ function mapUser(row) {
   };
 }
 
-function mapReport(row) {
+function mapReport(row, sourceEvidenceUrls = []) {
+  const storedEvidenceUrls = normalizeEvidenceUrls(row.evidence_urls);
+  const evidenceUrls = storedEvidenceUrls.length ? storedEvidenceUrls : normalizeEvidenceUrls(sourceEvidenceUrls);
   return {
     id: row.report_id,
     name: row.title,
@@ -408,10 +411,29 @@ function mapReport(row) {
     reportedAt: displayDateTime(row.created_at),
     userId: row.reporter_id || '',
     note: row.note || '',
-    evidenceCount: Number(row.evidence_count || 0),
-    evidenceUrls: normalizeEvidenceUrls(row.evidence_urls),
+    evidenceCount: Math.max(Number(row.evidence_count || 0), evidenceUrls.length),
+    evidenceUrls,
     updatedAt: row.updated_at
   };
+}
+
+async function sourceReportEvidence(reportRows) {
+  if (!appPool) return new Map();
+  const ids = reportRows.map((row) => Number(row.report_id)).filter((id) => Number.isInteger(id));
+  if (!ids.length) return new Map();
+  const evidence = new Map();
+  for (const table of ['app_issue_reports', 'merchant_issue_reports']) {
+    try {
+      const result = await appPool.query(`SELECT id, image_url FROM public.${table} WHERE id = ANY($1::int[]) AND image_url IS NOT NULL`, [ids]);
+      for (const row of result.rows) {
+        const urls = normalizeEvidenceUrls(row.image_url);
+        if (urls.length) evidence.set(String(row.id), urls);
+      }
+    } catch (error) {
+      console.warn(`ไม่สามารถอ่านหลักฐานจาก ${table}:`, error.message);
+    }
+  }
+  return evidence;
 }
 
 function mapNotification(row) {
@@ -487,8 +509,9 @@ async function snapshotFrom(client) {
     client.query('SELECT action_id, action_type, target_id, created_at FROM public.admin_actions ORDER BY created_at DESC LIMIT 200'),
     client.query('SELECT revision FROM public.admin_workspaces WHERE user_id = $1', [workspaceId])
   ]);
+  const sourceEvidence = await sourceReportEvidence(reports.rows);
   return {
-    data: {users: users.rows.map(mapUser), reports: reports.rows.map(mapReport), notifications: notifications.rows.map(mapNotification), history: history.rows.map(mapHistory), transactions: []},
+    data: {users: users.rows.map(mapUser), reports: reports.rows.map((row) => mapReport(row, sourceEvidence.get(String(row.report_id)) || [])), notifications: notifications.rows.map(mapNotification), history: history.rows.map(mapHistory), transactions: []},
     revision: Number(workspace.rows[0]?.revision || 0)
   };
 }
