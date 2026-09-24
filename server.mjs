@@ -123,14 +123,6 @@ async function syncReportStatusToApp({reportId, reporterType, status, note, prev
     }
     if (!source) throw new Error(`ไม่พบรายงาน #${reportId} ในฐานข้อมูลแอป`);
 
-    if (source.table === 'app_issue_reports') {
-      await client.query(`UPDATE public.app_issue_reports
-        SET status=$1, admin_note=$2, updated_at=now() WHERE id=$3`, [status, note.trim(), numericReportId]);
-    } else {
-      await client.query(`UPDATE public.merchant_issue_reports
-        SET status=$1, updated_at=now() WHERE id=$2`, [status, numericReportId]);
-    }
-
     let customerId = source.customer_id == null ? null : Number(source.customer_id);
     let merchantId = source.merchant_id == null ? null : Number(source.merchant_id);
     if (source.order_reference) {
