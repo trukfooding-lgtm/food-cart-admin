@@ -60,6 +60,29 @@ const normalizeEvidenceUrls = (value) => {
     .filter((url) => /^(https?:\/\/|\/)/i.test(url))
     .map((url) => /^\//.test(url) && foodCartBackendUrl ? `${foodCartBackendUrl}${url}` : url);
 };
+const normalizeAdminReportId = (data) => {
+  const reportId = text(data?.report_id || data?.id);
+  if (data?.reporter_type === 'Customer' && /^\d+$/.test(reportId)) return `customer:${reportId}`;
+  return reportId;
+};
+const sourceReportReference = (reportId) => {
+  const value = text(reportId);
+  const customerReport = value.match(/^customer:(\d+)$/i);
+  if (customerReport) return {table: 'app_issue_reports', id: Number(customerReport[1])};
+  const numericId = Number(value);
+  return Number.isInteger(numericId) ? {id: numericId} : null;
+};
+const sourceReportStatus = (status) => {
+  const value = text(status);
+  const mapped = {
+    PENDING: 'รอตรวจสอบ',
+    IN_REVIEW: 'กำลังตรวจสอบ',
+    INVESTIGATING: 'กำลังตรวจสอบ',
+    RESOLVED: 'ดำเนินการแล้ว',
+    CLOSED: 'ปิดเรื่อง'
+  }[value.toUpperCase()];
+  return mapped || (['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(value) ? value : 'รอตรวจสอบ');
+};
 const sign = (value, secret = sessionSecret || 'development-only-secret') => crypto.createHmac('sha256', secret).update(value).digest('base64url');
 const issueSession = (loginEmail = email) => {
   const exp = Date.now() + 8 * 60 * 60 * 1000;
@@ -103,13 +126,14 @@ async function syncReportStatusToApp({reportId, reporterType, status, note, prev
   if (previousStatus === status) return {changed: false, recipients: []};
   if (!appPool) throw new Error('ยังไม่ได้ตั้งค่า FOOD_CART_APP_DATABASE_URL สำหรับส่งแจ้งเตือนไปยังลูกค้าและร้านค้า');
 
-  const numericReportId = Number(reportId);
-  if (!Number.isInteger(numericReportId)) throw new Error('รหัสรายงานไม่ถูกต้องสำหรับการส่งแจ้งเตือน');
+  const sourceReference = sourceReportReference(reportId);
+  if (!sourceReference) throw new Error('รหัสรายงานไม่ถูกต้องสำหรับการส่งแจ้งเตือน');
+  const numericReportId = sourceReference.id;
 
   const client = await appPool.connect();
   try {
     await client.query('BEGIN');
-    const preferredTables = reporterType === 'Shop'
+    const preferredTables = sourceReference.table ? [sourceReference.table] : reporterType === 'Shop'
       ? ['merchant_issue_reports', 'app_issue_reports']
       : ['app_issue_reports', 'merchant_issue_reports'];
     let source = null;
@@ -333,7 +357,7 @@ function normalizeSupabaseWebhook(payload) {
     evidence_count: normalizeEvidenceUrls(row.image_url).length
   }};
   if (table === 'app_issue_reports') return {event_id: eventId, event_type: operation === 'INSERT' ? 'report.created' : 'report.updated', data: {
-    report_id: row.id || id,
+    report_id: String(row.sender_type || '').toUpperCase() === 'MERCHANT' ? (row.id || id) : `customer:${row.id || id}`,
     title: row.issue_type,
     reporter_id: row.sender_type === 'MERCHANT'
       ? (row.merchant_id == null ? null : `merchant:${row.merchant_id}`)
@@ -417,16 +441,17 @@ function mapReport(row, sourceReport = {}, reviewNote = '', refundTracking = nul
 
 async function sourceReportData(reportRows) {
   if (!appPool) return new Map();
-  const ids = reportRows.map((row) => Number(row.report_id)).filter((id) => Number.isInteger(id));
+  const ids = reportRows.map((row) => sourceReportReference(row.report_id)?.id).filter((id) => Number.isInteger(id));
   if (!ids.length) return new Map();
-  const sourceReports = new Map();
+  const sourceReportsBySourceKey = new Map();
   for (const table of ['app_issue_reports', 'merchant_issue_reports']) {
     try {
       const result = await appPool.query(`SELECT id, image_url, details FROM public.${table} WHERE id = ANY($1::int[])`, [ids]);
       for (const row of result.rows) {
         const urls = normalizeEvidenceUrls(row.image_url);
-        const previous = sourceReports.get(String(row.id)) || {};
-        sourceReports.set(String(row.id), {
+        const sourceKey = `${table}:${row.id}`;
+        const previous = sourceReportsBySourceKey.get(sourceKey) || {};
+        sourceReportsBySourceKey.set(sourceKey, {
           evidenceUrls: urls.length ? urls : previous.evidenceUrls || [],
           details: text(row.details) || previous.details || ''
         });
@@ -434,6 +459,14 @@ async function sourceReportData(reportRows) {
     } catch (error) {
       console.warn(`ไม่สามารถอ่านข้อมูลรายงานจาก ${table}:`, error.message);
     }
+  }
+  const sourceReports = new Map();
+  for (const report of reportRows) {
+    const sourceReference = sourceReportReference(report.report_id);
+    const sourceId = sourceReference?.id;
+    const sourceTable = sourceReference?.table || (report.reporter_type === 'Shop' ? 'merchant_issue_reports' : 'app_issue_reports');
+    const source = sourceReportsBySourceKey.get(`${sourceTable}:${sourceId}`);
+    if (source) sourceReports.set(String(report.report_id), source);
   }
   return sourceReports;
 }
@@ -488,7 +521,86 @@ async function ensureDb() {
   }
 }
 
+async function syncCustomerReportsFromApp(client) {
+  if (!appPool) return;
+  let result;
+  try {
+    result = await appPool.query(`SELECT r.id, r.sender_type, r.customer_id, r.merchant_id,
+        r.issue_type, r.order_reference, r.details, r.image_url, r.status, r.created_at,
+        r.updated_at, c.name_surname AS customer_name, m.name AS merchant_name
+      FROM public.app_issue_reports r
+      LEFT JOIN public.customer c ON c.customer_id = r.customer_id
+      LEFT JOIN public.merchant m ON m.id = r.merchant_id
+      WHERE upper(coalesce(r.sender_type, 'CUSTOMER')) <> 'MERCHANT'
+      ORDER BY r.id`);
+  } catch (error) {
+    console.warn('ไม่สามารถอ่านรายงานจากลูกค้าจากฐานข้อมูลแอป:', error.message);
+    return;
+  }
+
+  for (const row of result.rows) {
+    const rawReportId = String(row.id);
+    const namespacedReportId = `customer:${rawReportId}`;
+    const existing = await client.query(`SELECT report_id, reporter_type
+      FROM public.reports
+      WHERE report_id = ANY($1::text[])
+      ORDER BY CASE WHEN reporter_type='Customer' THEN 0 ELSE 1 END, report_id
+      LIMIT 1`, [[rawReportId, namespacedReportId]]);
+    const existingReport = existing.rows[0];
+    const reportId = existingReport?.reporter_type === 'Customer'
+      ? existingReport.report_id
+      : namespacedReportId;
+    const isNew = !existing.rows.some((item) => item.report_id === reportId);
+    const evidenceUrls = normalizeEvidenceUrls(row.image_url);
+    const reporterId = row.customer_id == null ? null : `customer:${row.customer_id}`;
+    const sourceNote = text(row.details);
+    const reportStatus = sourceReportStatus(row.status);
+
+    await client.query(`INSERT INTO public.reports
+        (report_id, title, reporter_id, reporter_type, reporter_name, shop_name, issue_type,
+         order_id, status, priority, note, evidence_count, evidence_urls, created_at, updated_at)
+      VALUES ($1,$2,$3,'Customer',$4,$5,$2,$6,$7,'ปกติ',$8,$9,$10,$11,$12)
+      ON CONFLICT (report_id) DO UPDATE SET
+        title=excluded.title,
+        reporter_id=excluded.reporter_id,
+        reporter_type=excluded.reporter_type,
+        reporter_name=excluded.reporter_name,
+        shop_name=excluded.shop_name,
+        issue_type=excluded.issue_type,
+        order_id=excluded.order_id,
+        evidence_count=excluded.evidence_count,
+        evidence_urls=excluded.evidence_urls`, [
+      reportId,
+      text(row.issue_type, 'รายงานปัญหา'),
+      reporterId,
+      text(row.customer_name),
+      text(row.merchant_name),
+      text(row.order_reference) || null,
+      reportStatus,
+      sourceNote,
+      evidenceUrls.length,
+      JSON.stringify(evidenceUrls),
+      row.created_at ? safeDate(row.created_at) : new Date(),
+      row.updated_at ? safeDate(row.updated_at) : new Date()
+    ]);
+
+    if (isNew) {
+      await client.query(`INSERT INTO public.notifications
+          (notification_id, source_type, source_id, title, body, priority, delivery_status)
+        SELECT $1,'report',$2,'มีรายงานใหม่',$3,'ปกติ','รอส่ง'
+        WHERE NOT EXISTS (
+          SELECT 1 FROM public.notifications
+          WHERE source_type='report' AND source_id=$2 AND title='มีรายงานใหม่'
+        )
+        ON CONFLICT (notification_id) DO NOTHING`, [
+        `report:${reportId}:created`, reportId, sourceNote || text(row.issue_type, 'มีรายงานใหม่')
+      ]);
+    }
+  }
+}
+
 async function snapshotFrom(client) {
+  await syncCustomerReportsFromApp(client);
   const [users, reports, notifications, history, reportReviews, refundReviews, workspace] = await Promise.all([
     client.query(`SELECT u.*, latest.metadata->>'suspension_until' AS suspension_until,
         latest.metadata->>'suspension_reason_type' AS suspension_reason_type
@@ -755,8 +867,9 @@ async function handleIntegrationEvent(event) {
       await client.query(`INSERT INTO public.app_orders (order_id, customer_id, merchant_id, total_amount, status, created_at, source_updated_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT (order_id) DO UPDATE SET customer_id=excluded.customer_id,merchant_id=excluded.merchant_id,total_amount=excluded.total_amount,status=excluded.status,source_updated_at=excluded.source_updated_at,updated_at=now()`, [text(data.order_id || data.id), text(data.customer_id) || null, text(data.merchant_id) || null, data.total_amount == null ? null : Number(data.total_amount), text(data.status) || null, data.created_at ? safeDate(data.created_at) : null, data.source_updated_at ? safeDate(data.source_updated_at) : null]);
     } else if (eventType === 'report.created' || eventType === 'report.updated') {
       const evidenceUrls = normalizeEvidenceUrls(data.evidence_urls || data.evidenceUrls);
-      await client.query(`INSERT INTO public.reports (report_id,title,reporter_id,reporter_type,reporter_name,shop_name,issue_type,order_id,status,priority,note,evidence_count,evidence_urls,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,now()) ON CONFLICT (report_id) DO UPDATE SET title=excluded.title,reporter_id=excluded.reporter_id,reporter_type=excluded.reporter_type,reporter_name=excluded.reporter_name,shop_name=excluded.shop_name,issue_type=excluded.issue_type,order_id=excluded.order_id,status=excluded.status,priority=excluded.priority,note=excluded.note,evidence_count=excluded.evidence_count,evidence_urls=excluded.evidence_urls,updated_at=now()`, [text(data.report_id || data.id), text(data.title || data.name, 'รายงานปัญหา'), text(data.reporter_id || data.user_id) || null, data.reporter_type === 'Shop' ? 'Shop' : 'Customer', text(data.reporter_name || data.person) || null, text(data.shop_name || data.shop) || null, text(data.issue_type || data.type, 'Other'), text(data.order_id || data.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(data.status) ? data.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ', text(data.note), Number(data.evidence_count || data.evidenceCount || evidenceUrls.length), JSON.stringify(evidenceUrls), data.created_at ? safeDate(data.created_at) : new Date()]);
-      if (eventType === 'report.created') await client.query(`INSERT INTO public.notifications (notification_id, source_type, source_id, title, body, priority, delivery_status) VALUES ($1,'report',$2,$3,$4,$5,'รอส่ง')`, [crypto.randomUUID(), text(data.report_id || data.id), 'มีรายงานใหม่', text(data.title || data.name, 'มีรายงานใหม่'), ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ']);
+      const reportId = normalizeAdminReportId(data);
+      await client.query(`INSERT INTO public.reports (report_id,title,reporter_id,reporter_type,reporter_name,shop_name,issue_type,order_id,status,priority,note,evidence_count,evidence_urls,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,now()) ON CONFLICT (report_id) DO UPDATE SET title=excluded.title,reporter_id=excluded.reporter_id,reporter_type=excluded.reporter_type,reporter_name=excluded.reporter_name,shop_name=excluded.shop_name,issue_type=excluded.issue_type,order_id=excluded.order_id,status=excluded.status,priority=excluded.priority,note=excluded.note,evidence_count=excluded.evidence_count,evidence_urls=excluded.evidence_urls,updated_at=now()`, [reportId, text(data.title || data.name, 'รายงานปัญหา'), text(data.reporter_id || data.user_id) || null, data.reporter_type === 'Shop' ? 'Shop' : 'Customer', text(data.reporter_name || data.person) || null, text(data.shop_name || data.shop) || null, text(data.issue_type || data.type, 'Other'), text(data.order_id || data.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(data.status) ? data.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ', text(data.note), Number(data.evidence_count || data.evidenceCount || evidenceUrls.length), JSON.stringify(evidenceUrls), data.created_at ? safeDate(data.created_at) : new Date()]);
+      if (eventType === 'report.created') await client.query(`INSERT INTO public.notifications (notification_id, source_type, source_id, title, body, priority, delivery_status) VALUES ($1,'report',$2,$3,$4,$5,'รอส่ง')`, [crypto.randomUUID(), reportId, 'มีรายงานใหม่', text(data.title || data.name, 'มีรายงานใหม่'), ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ']);
     } else if (eventType === 'notification.created') {
       await client.query(`INSERT INTO public.notifications (notification_id,recipient_id,source_type,source_id,title,body,priority,delivery_status,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (notification_id) DO NOTHING`, [text(data.notification_id || data.id, crypto.randomUUID()), text(data.recipient_id) || null, text(data.source_type) || null, text(data.source_id) || null, text(data.title, 'การแจ้งเตือน'), text(data.body), ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ', text(data.delivery_status, 'รอส่ง'), data.created_at ? safeDate(data.created_at) : new Date()]);
     }
