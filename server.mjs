@@ -391,6 +391,10 @@ function normalizeSnapshot(input) {
     reports: Array.isArray(input?.reports) ? input.reports : [],
     notifications: (Array.isArray(input?.notifications) ? input.notifications : []).filter((notification) => !/(refund|payment gateway|ธุรกรรม|คืนเงิน)/i.test(`${notification?.title || ''} ${notification?.body || ''}`)),
     history: Array.isArray(input?.history) ? input.history : [],
+    orderTrends: input?.orderTrends && typeof input.orderTrends === 'object' ? input.orderTrends : {
+      7: {days: [], previousDays: [], total: 0, previousTotal: 0},
+      30: {days: [], previousDays: [], total: 0, previousTotal: 0}
+    },
     // Payment Gateway / transaction / refund UI ถูกปิดไว้ชั่วคราวตามขอบเขตที่อนุมัติ
     transactions: []
   };
@@ -643,8 +647,77 @@ async function syncCustomerReportsFromApp(client) {
   }
 }
 
+async function syncOrdersFromApp(client) {
+  if (!appPool) return;
+  let result;
+  try {
+    result = await appPool.query(`SELECT id::text AS order_id, customer_id::text, merchant_id::text,
+        total_price, status, created_at, updated_at
+      FROM public.orders
+      ORDER BY id`);
+  } catch (error) {
+    console.warn('ไม่สามารถอ่านคำสั่งซื้อจากฐานข้อมูลแอป:', error.message);
+    return;
+  }
+
+  for (const row of result.rows) {
+    await client.query(`INSERT INTO public.app_orders
+        (order_id, customer_id, merchant_id, total_amount, status, created_at, source_updated_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,now())
+      ON CONFLICT (order_id) DO UPDATE SET
+        customer_id=excluded.customer_id,
+        merchant_id=excluded.merchant_id,
+        total_amount=excluded.total_amount,
+        status=excluded.status,
+        created_at=COALESCE(public.app_orders.created_at, excluded.created_at),
+        source_updated_at=excluded.source_updated_at,
+        updated_at=now()`, [
+      text(row.order_id),
+      text(row.customer_id) || null,
+      text(row.merchant_id) || null,
+      row.total_price == null ? null : Number(row.total_price),
+      text(row.status) || null,
+      row.created_at ? safeDate(row.created_at) : null,
+      row.updated_at ? safeDate(row.updated_at) : (row.created_at ? safeDate(row.created_at) : null)
+    ]);
+  }
+}
+
+async function readOrderTrendPeriod(client, days) {
+  const [current, previous] = await Promise.all([
+    client.query(`SELECT d::date AS day, COUNT(o.order_id)::int AS orders
+      FROM generate_series(CURRENT_DATE - ($1::int - 1), CURRENT_DATE, interval '1 day') d
+      LEFT JOIN public.app_orders o ON o.created_at::date = d::date
+      GROUP BY d::date
+      ORDER BY d::date`, [days]),
+    client.query(`SELECT d::date AS day, COUNT(o.order_id)::int AS orders
+      FROM generate_series(CURRENT_DATE - ($1::int * 2 - 1), CURRENT_DATE - $1::int, interval '1 day') d
+      LEFT JOIN public.app_orders o ON o.created_at::date = d::date
+      GROUP BY d::date
+      ORDER BY d::date`, [days])
+  ]);
+  const mapDays = rows => rows.map(row => ({date: String(row.day).slice(0, 10), orders: Number(row.orders || 0)}));
+  const daysNow = mapDays(current.rows);
+  const previousDays = mapDays(previous.rows);
+  return {
+    days: daysNow,
+    previousDays,
+    total: daysNow.reduce((sum, day) => sum + day.orders, 0),
+    previousTotal: previousDays.reduce((sum, day) => sum + day.orders, 0)
+  };
+}
+
+async function orderTrendData(client) {
+  const [seven, thirty] = await Promise.all([
+    readOrderTrendPeriod(client, 7),
+    readOrderTrendPeriod(client, 30)
+  ]);
+  return {7: seven, 30: thirty};
+}
+
 async function snapshotFrom(client) {
   await syncCustomerReportsFromApp(client);
+  await syncOrdersFromApp(client);
   const [users, reports, notifications, history, reportReviews, refundReviews, workspace] = await Promise.all([
     client.query(`SELECT u.*, latest.metadata->>'suspension_until' AS suspension_until,
         latest.metadata->>'suspension_reason_type' AS suspension_reason_type
@@ -673,6 +746,7 @@ async function snapshotFrom(client) {
       ORDER BY created_at DESC, action_id DESC`),
     client.query('SELECT revision FROM public.admin_workspaces WHERE user_id = $1', [workspaceId])
   ]);
+  const orderTrends = await orderTrendData(client);
   const sourceReports = await sourceReportData(reports.rows);
   const reviewNotes = new Map();
   for (const row of reportReviews.rows) {
@@ -692,7 +766,7 @@ async function snapshotFrom(client) {
     }
   }
   return {
-    data: {users: users.rows.map(mapUser), reports: reports.rows.map((row) => mapReport(row, sourceReports.get(String(row.report_id)) || {}, reviewNotes.get(String(row.report_id)) || '', refundTracking.get(String(row.report_id)) || null)), notifications: notifications.rows.map(mapNotification), history: history.rows.map(mapHistory), transactions: []},
+    data: {users: users.rows.map(mapUser), reports: reports.rows.map((row) => mapReport(row, sourceReports.get(String(row.report_id)) || {}, reviewNotes.get(String(row.report_id)) || '', refundTracking.get(String(row.report_id)) || null)), notifications: notifications.rows.map(mapNotification), history: history.rows.map(mapHistory), transactions: [], orderTrends},
     revision: Number(workspace.rows[0]?.revision || 0)
   };
 }
