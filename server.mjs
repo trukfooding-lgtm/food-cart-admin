@@ -85,6 +85,13 @@ const sourceReportStatus = (status) => {
   }[value.toUpperCase()];
   return mapped || (['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(value) ? value : 'รอตรวจสอบ');
 };
+const reportPriority = (...values) => {
+  const value = values.map(item => text(item)).join(' ').toLowerCase();
+  if (/(สลิปปลอม|ปลอม|ทุจริต|หลอกลวง|fraud|fake\s*slip|slip[_\s-]*mismatch|mismatch.*slip|security|ความปลอดภัย|ผิดปกติ)/i.test(value)) return 'สูงสุด';
+  if (/(คืนเงิน|ไม่คืนเงิน|refund|payment|ชำระ|สลิป|order|ออเดอร์|คำสั่งซื้อ|ยอดเงิน|เงินไม่เข้า|รับเงิน|รับอาหาร|ไม่มารับอาหาร)/i.test(value)) return 'สูง';
+  if (/(ข้อเสนอ|แนะนำ|ปรับปรุง|suggest|feedback|รายละเอียดเพิ่มเติม|ขอความช่วยเหลือ|รายงานปัญหาอื่น|other)/i.test(value)) return 'ต่ำ';
+  return 'ปกติ';
+};
 const sign = (value, secret = sessionSecret || 'development-only-secret') => crypto.createHmac('sha256', secret).update(value).digest('base64url');
 const issueSession = (loginEmail = email) => {
   const exp = Date.now() + 8 * 60 * 60 * 1000;
@@ -601,11 +608,12 @@ async function syncCustomerReportsFromApp(client) {
     const reporterId = row.customer_id == null ? null : `customer:${row.customer_id}`;
     const sourceNote = text(row.details);
     const reportStatus = sourceReportStatus(row.status);
+    const priority = reportPriority(row.issue_type, sourceNote);
 
     await client.query(`INSERT INTO public.reports
         (report_id, source_key, title, reporter_id, reporter_type, reporter_name, shop_name, issue_type,
          order_id, status, priority, note, evidence_count, evidence_urls, created_at, updated_at)
-      VALUES ($1,$2,$3,$4,'Customer',$5,$6,$3,$7,$8,'ปกติ',$9,$10,$11,$12,$13)
+      VALUES ($1,$2,$3,$4,'Customer',$5,$6,$3,$7,$8,$9,$10,$11,$12,$13,$14)
       ON CONFLICT (report_id) DO UPDATE SET
         source_key=excluded.source_key,
         title=excluded.title,
@@ -615,6 +623,7 @@ async function syncCustomerReportsFromApp(client) {
         shop_name=excluded.shop_name,
         issue_type=excluded.issue_type,
         order_id=excluded.order_id,
+        priority=excluded.priority,
         evidence_count=excluded.evidence_count,
         evidence_urls=excluded.evidence_urls`, [
       reportId,
@@ -625,6 +634,7 @@ async function syncCustomerReportsFromApp(client) {
       text(row.merchant_name),
       text(row.order_reference) || null,
       reportStatus,
+      priority,
       sourceNote,
       evidenceUrls.length,
       JSON.stringify(evidenceUrls),
@@ -635,14 +645,24 @@ async function syncCustomerReportsFromApp(client) {
     if (isNew) {
       await client.query(`INSERT INTO public.notifications
           (notification_id, source_type, source_id, title, body, priority, delivery_status)
-        SELECT $1,'report',$2,'มีรายงานใหม่',$3,'ปกติ','รอส่ง'
+        SELECT $1,'report',$2,'มีรายงานใหม่',$3,$4,'รอส่ง'
         WHERE NOT EXISTS (
           SELECT 1 FROM public.notifications
           WHERE source_type='report' AND source_id=$2 AND title='มีรายงานใหม่'
         )
         ON CONFLICT (notification_id) DO NOTHING`, [
-        `report:${reportId}:created`, reportId, sourceNote || text(row.issue_type, 'มีรายงานใหม่')
+        `report:${reportId}:created`, reportId, sourceNote || text(row.issue_type, 'มีรายงานใหม่'), priority
       ]);
+    }
+  }
+}
+
+async function refreshReportPriorities(client) {
+  const result = await client.query('SELECT report_id, title, issue_type, note, priority FROM public.reports');
+  for (const row of result.rows) {
+    const priority = reportPriority(row.issue_type, row.title, row.note);
+    if (row.priority !== priority) {
+      await client.query('UPDATE public.reports SET priority=$1 WHERE report_id=$2', [priority, row.report_id]);
     }
   }
 }
@@ -717,6 +737,7 @@ async function orderTrendData(client) {
 
 async function snapshotFrom(client) {
   await syncCustomerReportsFromApp(client);
+  await refreshReportPriorities(client);
   await syncOrdersFromApp(client);
   const [users, reports, notifications, history, reportReviews, refundReviews, workspace] = await Promise.all([
     client.query(`SELECT u.*, latest.metadata->>'suspension_until' AS suspension_until,
