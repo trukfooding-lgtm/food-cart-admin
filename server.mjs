@@ -386,7 +386,10 @@ function mapUser(row) {
   };
 }
 
-function mapReport(row, sourceReport = {}, reviewNote = '') {
+const refundTrackingStatuses = Object.freeze(['รอติดต่อร้านค้า', 'แจ้งร้านค้าแล้ว', 'รอหลักฐานการคืนเงิน', 'ส่งหลักฐานแล้ว', 'ยืนยันคืนเงินแล้ว', 'เกินกำหนด']);
+const refundDeadlineDays = 2;
+
+function mapReport(row, sourceReport = {}, reviewNote = '', refundTracking = null) {
   const storedEvidenceUrls = normalizeEvidenceUrls(row.evidence_urls);
   const evidenceUrls = storedEvidenceUrls.length ? storedEvidenceUrls : normalizeEvidenceUrls(sourceReport.evidenceUrls);
   return {
@@ -407,6 +410,7 @@ function mapReport(row, sourceReport = {}, reviewNote = '') {
     reviewNote: text(reviewNote),
     evidenceCount: Math.max(Number(row.evidence_count || 0), evidenceUrls.length),
     evidenceUrls,
+    refundTracking: refundTracking || null,
     updatedAt: row.updated_at
   };
 }
@@ -485,7 +489,7 @@ async function ensureDb() {
 }
 
 async function snapshotFrom(client) {
-  const [users, reports, notifications, history, reportReviews, workspace] = await Promise.all([
+  const [users, reports, notifications, history, reportReviews, refundReviews, workspace] = await Promise.all([
     client.query(`SELECT u.*, latest.metadata->>'suspension_until' AS suspension_until,
         latest.metadata->>'suspension_reason_type' AS suspension_reason_type
       FROM public.app_users u
@@ -508,6 +512,9 @@ async function snapshotFrom(client) {
     client.query(`SELECT target_id, reason FROM public.admin_actions
       WHERE target_type='report' AND action_type LIKE 'อัปเดต Report%' AND reason IS NOT NULL
       ORDER BY created_at DESC, action_id DESC`),
+    client.query(`SELECT target_id, reason, metadata, created_at FROM public.admin_actions
+      WHERE target_type='report' AND action_type='ติดตามการคืนเงิน'
+      ORDER BY created_at DESC, action_id DESC`),
     client.query('SELECT revision FROM public.admin_workspaces WHERE user_id = $1', [workspaceId])
   ]);
   const sourceReports = await sourceReportData(reports.rows);
@@ -517,8 +524,19 @@ async function snapshotFrom(client) {
       reviewNotes.set(String(row.target_id), text(row.reason));
     }
   }
+  const refundTracking = new Map();
+  for (const row of refundReviews.rows) {
+    if (!refundTracking.has(String(row.target_id))) {
+      refundTracking.set(String(row.target_id), {
+        ...(row.metadata && typeof row.metadata === 'object' ? row.metadata : {}),
+        status: text(row.metadata?.refund_status, 'รอติดต่อร้านค้า'),
+        updatedAt: row.created_at,
+        note: text(row.reason)
+      });
+    }
+  }
   return {
-    data: {users: users.rows.map(mapUser), reports: reports.rows.map((row) => mapReport(row, sourceReports.get(String(row.report_id)) || {}, reviewNotes.get(String(row.report_id)) || '')), notifications: notifications.rows.map(mapNotification), history: history.rows.map(mapHistory), transactions: []},
+    data: {users: users.rows.map(mapUser), reports: reports.rows.map((row) => mapReport(row, sourceReports.get(String(row.report_id)) || {}, reviewNotes.get(String(row.report_id)) || '', refundTracking.get(String(row.report_id)) || null)), notifications: notifications.rows.map(mapNotification), history: history.rows.map(mapHistory), transactions: []},
     revision: Number(workspace.rows[0]?.revision || 0)
   };
 }
@@ -581,6 +599,71 @@ async function writeRelationalAction(action, revision, admin) {
         await client.query(`UPDATE public.notifications SET is_read=true, read_at=COALESCE(read_at, now()), updated_at=now() WHERE is_read=false`);
         await recordAction(client, admin, 'อ่านการแจ้งเตือนทั้งหมด', 'notification', 'all', 'ผู้ดูแลอ่านการแจ้งเตือน');
       }
+    } else if (action?.type === 'refund.track') {
+      if (!can(admin, 'reports')) throw Object.assign(new Error('ไม่มีสิทธิ์ติดตามการคืนเงิน'), {code: 'FORBIDDEN'});
+      if (!refundTrackingStatuses.includes(action.status)) throw new Error('สถานะการติดตามคืนเงินไม่ถูกต้อง');
+      const report = await client.query(`SELECT report_id, reporter_type, order_id, reporter_id
+        FROM public.reports WHERE report_id=$1 FOR UPDATE`, [action.id]);
+      if (!report.rows.length) throw new Error('ไม่พบรายงานลูกค้า');
+      const sourceReport = report.rows[0];
+      if (sourceReport.reporter_type !== 'Customer' || !text(sourceReport.order_id)) {
+        throw new Error('ติดตามคืนเงินได้เฉพาะรายงานจากลูกค้าที่มีเลขออเดอร์');
+      }
+      const previousResult = await client.query(`SELECT metadata FROM public.admin_actions
+        WHERE target_type='report' AND target_id=$1 AND action_type='ติดตามการคืนเงิน'
+        ORDER BY created_at DESC, action_id DESC LIMIT 1`, [action.id]);
+      const previous = previousResult.rows[0]?.metadata && typeof previousResult.rows[0].metadata === 'object'
+        ? previousResult.rows[0].metadata : {};
+      const contactedAt = text(action.contactedAt, text(previous.contacted_at));
+      const contactNote = text(action.contactNote, text(previous.contact_note));
+      const proofReportId = text(action.proofReportId, text(previous.proof_report_id));
+      const verificationNote = text(action.verificationNote, text(previous.verification_note));
+      let deadlineAt = text(previous.deadline_at);
+      if (contactedAt) {
+        const contactDate = new Date(contactedAt);
+        if (Number.isNaN(contactDate.getTime())) throw new Error('วันเวลาการโทรไม่ถูกต้อง');
+        if (contactDate.getTime() > Date.now() + 60 * 1000) throw new Error('วันเวลาการโทรต้องไม่เกินเวลาปัจจุบัน');
+        deadlineAt = new Date(contactDate.getTime() + refundDeadlineDays * 24 * 60 * 60 * 1000).toISOString();
+      }
+      if (action.status === 'แจ้งร้านค้าแล้ว' && (!contactedAt || !validText(contactNote, 5, 1000))) {
+        throw new Error('กรุณาบันทึกวันเวลาและรายละเอียดการโทรเตือนร้านค้า');
+      }
+      if (['รอหลักฐานการคืนเงิน', 'ส่งหลักฐานแล้ว', 'ยืนยันคืนเงินแล้ว'].includes(action.status) && !deadlineAt) {
+        throw new Error('ยังไม่มีวันครบกำหนดจากการโทรเตือนร้านค้า');
+      }
+      if (['ส่งหลักฐานแล้ว', 'ยืนยันคืนเงินแล้ว'].includes(action.status)) {
+        if (!/^\d+$/.test(proofReportId)) throw new Error('กรุณาเลือกรายงานหลักฐานการคืนเงินจากร้านค้า');
+        const proof = await client.query(`SELECT report_id, evidence_count, evidence_urls, reporter_type, order_id
+          FROM public.reports WHERE report_id=$1 LIMIT 1`, [proofReportId]);
+        if (!proof.rows.length || proof.rows[0].reporter_type !== 'Shop' || String(proof.rows[0].order_id || '') !== String(sourceReport.order_id) || !hasReportEvidence(proof.rows[0])) {
+          throw new Error('หลักฐานต้องมาจากร้านค้า เป็นรายงานของออเดอร์เดียวกัน และมีรูปหลักฐาน');
+        }
+      }
+      if (action.status === 'ยืนยันคืนเงินแล้ว' && !validText(verificationNote, 5, 1000)) {
+        throw new Error('กรุณาบันทึกผลตรวจสอบหลักฐานจากร้านค้า');
+      }
+      if (action.status === 'เกินกำหนด') {
+        if (!deadlineAt || new Date(deadlineAt).getTime() > Date.now()) throw new Error('ยังไม่ถึงกำหนด 2 วันสำหรับการคืนเงิน');
+      }
+      const metadata = {
+        refund_status: action.status,
+        contacted_at: contactedAt || null,
+        deadline_at: deadlineAt || null,
+        contact_note: contactNote || null,
+        proof_report_id: proofReportId || null,
+        verification_note: verificationNote || null,
+        verified_at: action.status === 'ยืนยันคืนเงินแล้ว' ? now() : (previous.verified_at || null),
+        deadline_days: refundDeadlineDays
+      };
+      const actionNote = action.status === 'ยืนยันคืนเงินแล้ว'
+        ? `ตรวจหลักฐานร้านค้าแล้ว: ${verificationNote}`
+        : action.status === 'แจ้งร้านค้าแล้ว'
+          ? `โทรเตือนร้านค้าแล้ว ครบกำหนดคืนเงิน ${displayDateTime(deadlineAt)}`
+          : `ติดตามคืนเงิน: ${action.status}`;
+      if (['ยืนยันคืนเงินแล้ว', 'เกินกำหนด'].includes(action.status)) {
+        await syncReportStatusToApp({reportId: action.id, reporterType: 'Customer', status: action.status, note: actionNote, previousStatus: ''});
+      }
+      await recordAction(client, admin, 'ติดตามการคืนเงิน', 'report', action.id, actionNote, metadata);
     } else if (String(action?.type || '').startsWith('refund') || String(action?.type || '').startsWith('payment')) {
       throw new Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
     } else {
@@ -738,7 +821,8 @@ app.post('/api/admin', requireAdmin, async (req, res) => {
       return json(res, saved);
     }
     if (memory.revision !== revision) return json(res, {error: 'ข้อมูลเปลี่ยนแปลง กรุณาโหลดใหม่'}, 409);
-    if (String(req.body.action.type || '').startsWith('refund') || String(req.body.action.type || '').startsWith('payment')) throw new Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
+    const actionType = String(req.body.action.type || '');
+    if ((actionType.startsWith('refund') && actionType !== 'refund.track') || actionType.startsWith('payment')) throw new Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
     memory = {payload: normalizeSnapshot(applyAction(memory.payload, req.body.action)), revision: revision + 1};
     return json(res, {data: memory.payload, revision: memory.revision});
   } catch (error) {

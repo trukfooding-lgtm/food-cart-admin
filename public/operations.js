@@ -54,7 +54,17 @@ export function applyAction(input,action){
    u.suspensionUntil=null;u.suspensionReasonType='';u.reason=action.reason.trim();
   }
   u.status=action.status;u.suspensionHistory??=[];u.suspensionHistory.unshift({status:action.status,reason:u.reason,admin:action.admin||'Admin',at:now,until:u.suspensionUntil});audit=action.status+': '+u.reason;target=u.id;
- // Payment / refund operations are intentionally disabled until a separate scope is approved.
+ }else if(action.type==='refund.track'){
+  const r=next.reports.find(item=>item.id===action.id);if(!r)throw Error('ไม่พบรายงานลูกค้า');
+  if(r.reporterType!=='Customer'||!r.orderId)throw Error('ติดตามคืนเงินได้เฉพาะรายงานจากลูกค้าที่มีเลขออเดอร์');
+  const statuses=['รอติดต่อร้านค้า','แจ้งร้านค้าแล้ว','รอหลักฐานการคืนเงิน','ส่งหลักฐานแล้ว','ยืนยันคืนเงินแล้ว','เกินกำหนด'];if(!statuses.includes(action.status))throw Error('สถานะการติดตามคืนเงินไม่ถูกต้อง');
+  const previous=r.refundTracking||{};const contactedAt=action.contactedAt||previous.contacted_at||'';const contactNote=(action.contactNote??previous.contact_note??'').trim();const proofReportId=action.proofReportId||previous.proof_report_id||'';const verificationNote=(action.verificationNote??previous.verification_note??'').trim();const deadlineAt=contactedAt?new Date(new Date(contactedAt).getTime()+2*86400000).toISOString():(previous.deadline_at||'');
+  if(action.status==='แจ้งร้านค้าแล้ว'&&(!contactedAt||contactNote.length<5))throw Error('กรุณาบันทึกวันเวลาและรายละเอียดการโทรเตือนร้านค้า');
+  if(['รอหลักฐานการคืนเงิน','ส่งหลักฐานแล้ว','ยืนยันคืนเงินแล้ว'].includes(action.status)&&!deadlineAt)throw Error('ยังไม่มีวันครบกำหนดจากการโทรเตือนร้านค้า');
+  if(['ส่งหลักฐานแล้ว','ยืนยันคืนเงินแล้ว'].includes(action.status)){const proof=next.reports.find(item=>String(item.id)===String(proofReportId));if(!proof||proof.reporterType!=='Shop'||String(proof.orderId)!==String(r.orderId)||!((proof.evidenceCount||0)>0||(proof.evidenceUrls||[]).length))throw Error('กรุณาเลือกรายงานหลักฐานการคืนเงินจากร้านค้าที่มีรูปหลักฐาน')}
+  if(action.status==='ยืนยันคืนเงินแล้ว'&&verificationNote.length<5)throw Error('กรุณาบันทึกผลตรวจสอบหลักฐานจากร้านค้า');
+  if(action.status==='เกินกำหนด'&&(!deadlineAt||new Date(deadlineAt)>new Date()))throw Error('ยังไม่ถึงกำหนด 2 วันสำหรับการคืนเงิน');
+  r.refundTracking={status:action.status,contacted_at:contactedAt,deadline_at:deadlineAt,contact_note:contactNote,proof_report_id:proofReportId,verification_note:verificationNote,verified_at:action.status==='ยืนยันคืนเงินแล้ว'?now:(previous.verified_at||''),deadline_days:2,updatedAt:now};audit='ติดตามการคืนเงิน: '+action.status;target=r.id;
  }else if(action.type==='refund.note'||String(action.type||'').startsWith('payment')){
   throw Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
  }else if(action.type==='notification.read'){if(action.id){next.notifications.forEach(n=>{if(String(n.id)===String(action.id))n.read=true})}else next.notifications.forEach(n=>{n.read=true});return next;
