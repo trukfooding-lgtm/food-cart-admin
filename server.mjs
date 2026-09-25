@@ -688,9 +688,6 @@ async function writeRelationalAction(action, revision, admin) {
       const suspensionPlan = action.status === 'ระงับบัญชี'
         ? buildSuspensionPlan(action, user.rows[0])
         : {reasonType: 'lift_suspension', durationDays: null, until: null, effectiveReason: action.reason.trim()};
-      const suspensionEvidence = action.status === 'ระงับบัญชี'
-        ? await findSuspensionEvidence(client, user.rows[0], suspensionPlan.reasonType)
-        : null;
       const eventId = crypto.randomUUID();
       await syncAccountStatus({...action, role: user.rows[0].role, reason: suspensionPlan.effectiveReason}, admin, eventId);
       const result = await client.query(`UPDATE public.app_users SET status=$1, status_reason=$2, status_changed_by=$3, status_changed_at=now(), updated_at=now() WHERE user_id=$4 RETURNING user_id`, [action.status, suspensionPlan.effectiveReason, adminId, action.id]);
@@ -699,8 +696,7 @@ async function writeRelationalAction(action, revision, admin) {
         event_id: eventId,
         backend_synced: true,
         suspension_reason_type: suspensionPlan.reasonType,
-        ...(suspensionPlan.until ? {suspension_until: suspensionPlan.until, suspension_duration_days: suspensionPlan.durationDays} : {}),
-        ...(suspensionEvidence ? {suspension_report_id: suspensionEvidence.report_id} : {})
+        ...(suspensionPlan.until ? {suspension_until: suspensionPlan.until, suspension_duration_days: suspensionPlan.durationDays} : {})
       });
     } else if (action?.type === 'notification.read') {
       if (action.id) {
