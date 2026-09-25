@@ -87,7 +87,7 @@ const sourceReportStatus = (status) => {
 };
 const reportPriority = (...values) => {
   const value = values.map(item => text(item)).join(' ').toLowerCase();
-  if (/(สลิปปลอม|ปลอม|ทุจริต|หลอกลวง|fraud|fake\s*slip|slip[_\s-]*mismatch|mismatch.*slip|security|ความปลอดภัย|ผิดปกติ)/i.test(value)) return 'สูงสุด';
+  if (/(สลิปปลอม|ปลอม|ไม่แท้|สลิปไม่|ไม่ผ่านการตรวจสอบ|ทุจริต|หลอกลวง|fraud|fake\s*slip|slip[_\s-]*mismatch|mismatch.*slip|security|ความปลอดภัย|ผิดปกติ)/i.test(value)) return 'สูงสุด';
   if (/(คืนเงิน|ไม่คืนเงิน|refund|payment|ชำระ|สลิป|order|ออเดอร์|คำสั่งซื้อ|ยอดเงิน|เงินไม่เข้า|รับเงิน|รับอาหาร|ไม่มารับอาหาร)/i.test(value)) return 'สูง';
   if (/(ข้อเสนอ|แนะนำ|ปรับปรุง|suggest|feedback|รายละเอียดเพิ่มเติม|ขอความช่วยเหลือ|รายงานปัญหาอื่น|other)/i.test(value)) return 'ต่ำ';
   return 'ปกติ';
