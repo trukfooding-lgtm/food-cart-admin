@@ -65,7 +65,9 @@ const normalizeAdminReportId = (data) => {
   if (data?.reporter_type === 'Customer' && /^\d+$/.test(reportId)) return `customer:${reportId}`;
   return reportId;
 };
-const sourceReportReference = (reportId) => {
+const sourceReportReference = (reportId, sourceKey = '') => {
+  const source = text(sourceKey).match(/^(app_issue_reports|merchant_issue_reports):(\d+)$/i);
+  if (source) return {table: source[1].toLowerCase(), id: Number(source[2])};
   const value = text(reportId);
   const customerReport = value.match(/^customer:(\d+)$/i);
   if (customerReport) return {table: 'app_issue_reports', id: Number(customerReport[1])};
@@ -92,6 +94,10 @@ const issueSession = (loginEmail = email) => {
 
 async function syncAccountStatus(action, admin, eventId) {
   if (!foodCartBackendUrl || !foodCartAdminSecret) throw new Error('ยังไม่ได้ตั้งค่าการเชื่อมต่อ Backend สำหรับสถานะบัญชี');
+  const role = action.role === 'Shop' ? 'Shop' : 'Customer';
+  const accountType = role === 'Shop' ? 'merchant' : 'customer';
+  const accountId = Number(externalUserId(action.id));
+  if (!Number.isInteger(accountId) || accountId <= 0) throw new Error('รหัสบัญชีไม่ถูกต้อง');
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
   try {
@@ -103,8 +109,9 @@ async function syncAccountStatus(action, admin, eventId) {
       },
       body: JSON.stringify({
         event_id: eventId,
-        user_id: action.id,
-        role: action.role,
+        user_id: `${accountType}:${accountId}`,
+        account_id: accountId,
+        role,
         status: action.status,
         reason: action.reason.trim(),
         changed_by: admin.name
@@ -122,11 +129,11 @@ async function syncAccountStatus(action, admin, eventId) {
   }
 }
 
-async function syncReportStatusToApp({reportId, reporterType, status, note, previousStatus}) {
+async function syncReportStatusToApp({reportId, sourceKey, reporterType, status, note, previousStatus}) {
   if (previousStatus === status) return {changed: false, recipients: []};
   if (!appPool) throw new Error('ยังไม่ได้ตั้งค่า FOOD_CART_APP_DATABASE_URL สำหรับส่งแจ้งเตือนไปยังลูกค้าและร้านค้า');
 
-  const sourceReference = sourceReportReference(reportId);
+  const sourceReference = sourceReportReference(reportId, sourceKey);
   if (!sourceReference) throw new Error('รหัสรายงานไม่ถูกต้องสำหรับการส่งแจ้งเตือน');
   const numericReportId = sourceReference.id;
 
@@ -521,6 +528,40 @@ async function ensureDb() {
   }
 }
 
+async function remapReportReferences(client, fromId, toId) {
+  await client.query(`UPDATE public.notifications
+    SET source_id=$1, updated_at=now()
+    WHERE source_type='report' AND source_id=$2`, [toId, fromId]);
+  await client.query(`UPDATE public.admin_actions
+    SET target_id=$1
+    WHERE target_type='report' AND target_id=$2`, [toId, fromId]);
+  await client.query(`UPDATE public.admin_actions
+    SET metadata=jsonb_set(metadata, '{proof_report_id}', to_jsonb($1::text), false)
+    WHERE metadata->>'proof_report_id'=$2`, [toId, fromId]);
+}
+
+async function nextNumericReportId(client) {
+  const result = await client.query(`SELECT COALESCE(MAX(CASE
+      WHEN report_id ~ '^[0-9]+$' THEN report_id::bigint ELSE 0 END), 0) + 1 AS next_id
+    FROM public.reports`);
+  return String(result.rows[0]?.next_id || 1);
+}
+
+async function migrateLegacyCustomerReportIds(client) {
+  const legacy = await client.query(`SELECT report_id
+    FROM public.reports
+    WHERE reporter_type='Customer' AND report_id ~ '^customer:[0-9]+$'
+    ORDER BY created_at, report_id`);
+  for (const row of legacy.rows) {
+    const sourceId = row.report_id.replace(/^customer:/, '');
+    const newReportId = await nextNumericReportId(client);
+    await remapReportReferences(client, row.report_id, newReportId);
+    await client.query(`UPDATE public.reports
+      SET report_id=$1, source_key=$2
+      WHERE report_id=$3`, [newReportId, `app_issue_reports:${sourceId}`, row.report_id]);
+  }
+}
+
 async function syncCustomerReportsFromApp(client) {
   if (!appPool) return;
   let result;
@@ -538,29 +579,31 @@ async function syncCustomerReportsFromApp(client) {
     return;
   }
 
+  await migrateLegacyCustomerReportIds(client);
   for (const row of result.rows) {
     const rawReportId = String(row.id);
+    const sourceKey = `app_issue_reports:${rawReportId}`;
     const namespacedReportId = `customer:${rawReportId}`;
-    const existing = await client.query(`SELECT report_id, reporter_type
+    const existing = await client.query(`SELECT report_id
       FROM public.reports
-      WHERE report_id = ANY($1::text[])
-      ORDER BY CASE WHEN reporter_type='Customer' THEN 0 ELSE 1 END, report_id
-      LIMIT 1`, [[rawReportId, namespacedReportId]]);
+      WHERE source_key=$1
+         OR (reporter_type='Customer' AND report_id = ANY($2::text[]))
+      ORDER BY CASE WHEN source_key=$1 THEN 0 ELSE 1 END, report_id
+      LIMIT 1`, [sourceKey, [rawReportId, namespacedReportId]]);
     const existingReport = existing.rows[0];
-    const reportId = existingReport?.reporter_type === 'Customer'
-      ? existingReport.report_id
-      : namespacedReportId;
-    const isNew = !existing.rows.some((item) => item.report_id === reportId);
+    const reportId = existingReport?.report_id || await nextNumericReportId(client);
+    const isNew = !existingReport;
     const evidenceUrls = normalizeEvidenceUrls(row.image_url);
     const reporterId = row.customer_id == null ? null : `customer:${row.customer_id}`;
     const sourceNote = text(row.details);
     const reportStatus = sourceReportStatus(row.status);
 
     await client.query(`INSERT INTO public.reports
-        (report_id, title, reporter_id, reporter_type, reporter_name, shop_name, issue_type,
+        (report_id, source_key, title, reporter_id, reporter_type, reporter_name, shop_name, issue_type,
          order_id, status, priority, note, evidence_count, evidence_urls, created_at, updated_at)
-      VALUES ($1,$2,$3,'Customer',$4,$5,$2,$6,$7,'ปกติ',$8,$9,$10,$11,$12)
+      VALUES ($1,$2,$3,$4,'Customer',$5,$6,$3,$7,$8,'ปกติ',$9,$10,$11,$12,$13)
       ON CONFLICT (report_id) DO UPDATE SET
+        source_key=excluded.source_key,
         title=excluded.title,
         reporter_id=excluded.reporter_id,
         reporter_type=excluded.reporter_type,
@@ -571,6 +614,7 @@ async function syncCustomerReportsFromApp(client) {
         evidence_count=excluded.evidence_count,
         evidence_urls=excluded.evidence_urls`, [
       reportId,
+      sourceKey,
       text(row.issue_type, 'รายงานปัญหา'),
       reporterId,
       text(row.customer_name),
@@ -673,11 +717,11 @@ async function writeRelationalAction(action, revision, admin) {
     if (action?.type === 'report.update') {
       if (!can(admin, 'reports')) throw Object.assign(new Error('ไม่มีสิทธิ์แก้ไขรายงาน'), {code: 'FORBIDDEN'});
       if (!['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(action.status) || !validText(action.note, 5, 2000)) throw new Error('ข้อมูลรายงานไม่ถูกต้อง');
-      const existing = await client.query(`SELECT status, reporter_type FROM public.reports WHERE report_id=$1 FOR UPDATE`, [action.id]);
+      const existing = await client.query(`SELECT status, reporter_type, source_key FROM public.reports WHERE report_id=$1 FOR UPDATE`, [action.id]);
       if (!existing.rows.length) throw new Error('ไม่พบรายงาน');
-      const result = await client.query(`UPDATE public.reports SET status=$1, updated_at=now() WHERE report_id=$2 RETURNING reporter_id, reporter_type, priority`, [action.status, action.id]);
+      const result = await client.query(`UPDATE public.reports SET status=$1, updated_at=now() WHERE report_id=$2 RETURNING reporter_id, reporter_type, priority, source_key`, [action.status, action.id]);
       if (!result.rows.length) throw new Error('ไม่พบรายงาน');
-      if (action.notify === true) await syncReportStatusToApp({reportId: action.id, reporterType: result.rows[0].reporter_type || existing.rows[0].reporter_type, status: action.status, note: action.note, previousStatus: existing.rows[0].status});
+      if (action.notify === true) await syncReportStatusToApp({reportId: action.id, sourceKey: result.rows[0].source_key || existing.rows[0].source_key, reporterType: result.rows[0].reporter_type || existing.rows[0].reporter_type, status: action.status, note: action.note, previousStatus: existing.rows[0].status});
       if (action.notify === true) await client.query(`INSERT INTO public.notifications (notification_id, recipient_id, source_type, source_id, title, body, priority, delivery_status) VALUES ($1,$2,'report',$3,$4,$5,$6,'รอส่ง')`, [crypto.randomUUID(), result.rows[0].reporter_id || null, action.id, `รายงาน #${action.id} อัปเดตแล้ว`, action.note.trim(), result.rows[0].priority || 'ปกติ']);
       await recordAction(client, admin, `อัปเดต Report เป็น ${action.status}`, 'report', action.id, action.note);
     } else if (action?.type === 'user.status') {
@@ -710,7 +754,7 @@ async function writeRelationalAction(action, revision, admin) {
     } else if (action?.type === 'refund.track') {
       if (!can(admin, 'reports')) throw Object.assign(new Error('ไม่มีสิทธิ์ติดตามการคืนเงิน'), {code: 'FORBIDDEN'});
       if (!refundTrackingStatuses.includes(action.status)) throw new Error('สถานะการติดตามคืนเงินไม่ถูกต้อง');
-      const report = await client.query(`SELECT report_id, reporter_type, order_id, reporter_id
+      const report = await client.query(`SELECT report_id, source_key, reporter_type, order_id, reporter_id
         FROM public.reports WHERE report_id=$1 FOR UPDATE`, [action.id]);
       if (!report.rows.length) throw new Error('ไม่พบรายงานลูกค้า');
       const sourceReport = report.rows[0];
@@ -769,7 +813,7 @@ async function writeRelationalAction(action, revision, admin) {
           ? `โทรเตือนร้านค้าแล้ว ครบกำหนดคืนเงิน ${displayDateTime(deadlineAt)}`
           : `ติดตามคืนเงิน: ${action.status}`;
       if (['ยืนยันคืนเงินแล้ว', 'เกินกำหนด'].includes(action.status)) {
-        await syncReportStatusToApp({reportId: action.id, reporterType: 'Customer', status: action.status, note: actionNote, previousStatus: ''});
+        await syncReportStatusToApp({reportId: action.id, sourceKey: sourceReport.source_key, reporterType: 'Customer', status: action.status, note: actionNote, previousStatus: ''});
       }
       await recordAction(client, admin, 'ติดตามการคืนเงิน', 'report', action.id, actionNote, metadata);
     } else if (String(action?.type || '').startsWith('refund') || String(action?.type || '').startsWith('payment')) {

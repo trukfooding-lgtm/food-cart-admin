@@ -99,6 +99,10 @@ create table if not exists public.reports (
 -- เก็บ URL หลักฐานจริงจากรายงานเดิมโดยไม่กระทบข้อมูลเดิม
 alter table public.reports
   add column if not exists evidence_urls jsonb not null default '[]'::jsonb;
+alter table public.reports
+  add column if not exists source_key text;
+create unique index if not exists reports_source_key_idx
+  on public.reports (source_key) where source_key is not null;
 
 create table if not exists public.notifications (
   notification_id text primary key,
