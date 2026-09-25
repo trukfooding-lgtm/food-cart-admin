@@ -307,4 +307,5 @@ html.dark .btn.danger:hover:not(:disabled) svg,html.dark .btn.danger:focus-visib
 .admin-logout:hover{background:#44253c;border-color:#be5870;color:#ff8f8f}
 .admin-logout svg{width:16px;height:16px}
 .collapsed .admin-menu{display:none!important}
+.filter-dropdown{position:relative;display:inline-block;z-index:20}.filter-menu{position:absolute;right:0;top:calc(100% + 6px);min-width:120px;padding:6px 0;background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:0 10px 24px #1d2b3d1c}.filter-option{display:block;width:100%;padding:8px 14px;text-align:left;color:var(--ink);font-size:12px}.filter-option:hover{background:var(--soft)}
 
