@@ -43,7 +43,7 @@ export function applyAction(input,action){
   if(action.status==='ระงับบัญชี'){
    const policy=suspensionPolicies[action.reasonType];
    if(!policy||!policy.roles.includes(u.role))throw Error('ประเภทเหตุผลไม่ตรงกับประเภทบัญชี');
-   if(policy.temporary&&! [7,30].includes(Number(action.durationDays)))throw Error('การระงับพฤติกรรมต้องเลือก 7 วันหรือ 30 วัน');
+   if(policy.temporary&&! [7,14,21,30].includes(Number(action.durationDays)))throw Error('การระงับพฤติกรรมต้องเลือก 7, 14, 21 หรือ 30 วัน');
    if(policy.permanent&&action.durationDays!=null)throw Error('กรณีนี้ต้องเป็นการระงับโดยไม่มีกำหนด');
    findSuspensionEvidence(next,u,action.reasonType);
    const suspensionUntil=policy.temporary?new Date(Date.now()+Number(action.durationDays)*86400000).toISOString():null;

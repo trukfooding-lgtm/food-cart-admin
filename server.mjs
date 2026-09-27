@@ -312,7 +312,7 @@ function buildSuspensionPlan(action, user) {
   if (!validText(reason, 5, 1000)) throw new Error('เหตุผลบัญชีไม่ถูกต้อง');
   if (policy.temporary) {
     const durationDays = Number(action.durationDays);
-    if (![7, 30].includes(durationDays)) throw new Error('การระงับพฤติกรรมต้องเลือก 7 วันหรือ 30 วัน');
+    if (![7, 14, 21, 30].includes(durationDays)) throw new Error('การระงับพฤติกรรมต้องเลือก 7, 14, 21 หรือ 30 วัน');
     const until = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000);
     return {
       reasonType: text(action.reasonType),
