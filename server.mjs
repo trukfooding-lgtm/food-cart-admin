@@ -906,7 +906,7 @@ async function writeRelationalAction(action, revision, admin) {
         ? `ตรวจหลักฐานร้านค้าแล้ว: ${verificationNote}`
         : action.status === 'แจ้งร้านค้าแล้ว'
           ? `โทรเตือนร้านค้าแล้ว ครบกำหนดคืนเงิน ${displayDateTime(deadlineAt)}`
-          : `ติดตามคืนเงิน: ${action.status}`;
+          : action.status === 'เกินกำหนด' ? 'รายงานร้านค้าไม่คืนเงิน: เกินกำหนด 2 วัน' : `ติดตามคืนเงิน: ${action.status}`;
       if (['ยืนยันคืนเงินแล้ว', 'เกินกำหนด'].includes(action.status)) {
         await syncReportStatusToApp({reportId: action.id, sourceKey: sourceReport.source_key, reporterType: 'Customer', status: action.status, note: actionNote, previousStatus: ''});
       }
