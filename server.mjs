@@ -16,6 +16,10 @@ const supabaseUrl = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const supabasePublishableKey = String(process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || '');
 const webhookSecret = String(process.env.FOOD_CART_WEBHOOK_SECRET || '');
 const foodCartBackendUrl = String(process.env.FOOD_CART_BACKEND_URL || '').replace(/\/$/, '');
+// Evidence uploaded by the app is stored as /uploads/... paths. Keep a safe
+// public backend fallback so old reports remain viewable when the optional
+// environment variable is not present on the admin service.
+const evidenceBackendUrl = foodCartBackendUrl || 'https://food-cart-c20i.onrender.com';
 const foodCartAdminSecret = String(process.env.FOOD_CART_ADMIN_SECRET || '');
 const foodCartAppDatabaseUrl = String(process.env.FOOD_CART_APP_DATABASE_URL || '').trim();
 const adminId = `env:${email || 'administrator'}`;
@@ -58,7 +62,7 @@ const normalizeEvidenceUrls = (value) => {
   return values
     .map((item) => text(item))
     .filter((url) => /^(https?:\/\/|\/)/i.test(url))
-    .map((url) => /^\//.test(url) && foodCartBackendUrl ? `${foodCartBackendUrl}${url}` : url);
+    .map((url) => /^\//.test(url) ? `${evidenceBackendUrl}${url}` : url);
 };
 const normalizeAdminReportId = (data) => {
   const reportId = text(data?.report_id || data?.id);
