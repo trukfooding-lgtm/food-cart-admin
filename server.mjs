@@ -469,20 +469,67 @@ async function sourceReportData(reportRows) {
   const sourceReportsBySourceKey = new Map();
   for (const table of ['app_issue_reports', 'merchant_issue_reports']) {
     try {
-      const result = await appPool.query(`SELECT id, image_url, details FROM public.${table} WHERE id = ANY($1::int[])`, [ids]);
+      const result = await appPool.query(`SELECT id, image_url, details, order_reference FROM public.${table} WHERE id = ANY($1::int[])`, [ids]);
       for (const row of result.rows) {
         const urls = normalizeEvidenceUrls(row.image_url);
         const sourceKey = `${table}:${row.id}`;
         const previous = sourceReportsBySourceKey.get(sourceKey) || {};
         sourceReportsBySourceKey.set(sourceKey, {
           evidenceUrls: urls.length ? urls : previous.evidenceUrls || [],
-          details: text(row.details) || previous.details || ''
+          details: text(row.details) || previous.details || '',
+          orderReference: text(row.order_reference) || previous.orderReference || ''
         });
       }
     } catch (error) {
       console.warn(`ไม่สามารถอ่านข้อมูลรายงานจาก ${table}:`, error.message);
     }
   }
+
+  const merchantReports = reportRows
+    .map((report) => {
+      const sourceReference = sourceReportReference(report.report_id);
+      const sourceTable = sourceReference?.table || (report.reporter_type === 'Shop' ? 'merchant_issue_reports' : 'app_issue_reports');
+      const sourceId = sourceReference?.id;
+      const source = sourceReportsBySourceKey.get(`${sourceTable}:${sourceId}`);
+      return sourceTable === 'merchant_issue_reports' && source?.orderReference
+        ? {sourceKey: `${sourceTable}:${sourceId}`, orderReference: source.orderReference}
+        : null;
+    })
+    .filter(Boolean);
+  const orderKeys = [...new Set(merchantReports.flatMap(({orderReference}) => {
+    const value = text(orderReference);
+    const numericValue = value.replace(/^ORD[-_#]?/i, '');
+    return [value, numericValue].filter(Boolean);
+  }))];
+  if (orderKeys.length) {
+    try {
+      const slips = await appPool.query(`SELECT order_id, slip_url
+        FROM public.order_slips
+        WHERE order_id = ANY($1::text[])
+        ORDER BY created_at DESC`, [orderKeys]);
+      const evidenceByOrder = new Map();
+      for (const slip of slips.rows) {
+        const urls = normalizeEvidenceUrls(slip.slip_url);
+        if (!urls.length) continue;
+        const key = text(slip.order_id);
+        const existing = evidenceByOrder.get(key) || [];
+        evidenceByOrder.set(key, [...new Set([...existing, ...urls])]);
+      }
+      for (const {sourceKey, orderReference} of merchantReports) {
+        const value = text(orderReference);
+        const numericValue = value.replace(/^ORD[-_#]?/i, '');
+        const fallbackUrls = [...new Set([
+          ...(evidenceByOrder.get(value) || []),
+          ...(evidenceByOrder.get(numericValue) || [])
+        ])];
+        const source = sourceReportsBySourceKey.get(sourceKey);
+        if (source && !source.evidenceUrls?.length && fallbackUrls.length) source.evidenceUrls = fallbackUrls;
+      }
+    } catch (error) {
+      console.warn('ไม่สามารถอ่านหลักฐานสลิปจากคำสั่งซื้อ:', error.message);
+    }
+  }
+
   const sourceReports = new Map();
   for (const report of reportRows) {
     const sourceReference = sourceReportReference(report.report_id);
