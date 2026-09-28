@@ -38,6 +38,7 @@ const text = (value, fallback = '') => String(value ?? fallback).trim();
 const validText = (value, min, max) => typeof value === 'string' && value.trim().length >= min && value.trim().length <= max;
 const safeDate = (value) => value ? new Date(value) : new Date();
 const reportTimeZone = 'Asia/Bangkok';
+const completedOrderStatuses = Object.freeze(['รับอาหารสำเร็จแล้ว', 'สำเร็จ', 'รับอาหารแล้ว', 'เสร็จสิ้น']);
 const displayTime = (value) => safeDate(value).toLocaleTimeString('th-TH', {timeZone: reportTimeZone, hour: '2-digit', minute: '2-digit', hour12: false});
 const displayDate = (value) => safeDate(value).toLocaleDateString('th-TH', {day: 'numeric', month: 'short', year: 'numeric'});
 const displayDateTime = (value) => {
@@ -711,14 +712,14 @@ async function readOrderTrendPeriod(client, days) {
   const [current, previous] = await Promise.all([
     client.query(`SELECT d::date AS day, COUNT(o.order_id)::int AS orders
       FROM generate_series(CURRENT_DATE - ($1::int - 1), CURRENT_DATE, interval '1 day') d
-      LEFT JOIN public.app_orders o ON o.created_at::date = d::date
+      LEFT JOIN public.app_orders o ON o.created_at::date = d::date AND o.status = ANY($2::text[])
       GROUP BY d::date
-      ORDER BY d::date`, [days]),
+      ORDER BY d::date`, [days, completedOrderStatuses]),
     client.query(`SELECT d::date AS day, COUNT(o.order_id)::int AS orders
       FROM generate_series(CURRENT_DATE - ($1::int * 2 - 1), CURRENT_DATE - $1::int, interval '1 day') d
-      LEFT JOIN public.app_orders o ON o.created_at::date = d::date
+      LEFT JOIN public.app_orders o ON o.created_at::date = d::date AND o.status = ANY($2::text[])
       GROUP BY d::date
-      ORDER BY d::date`, [days])
+      ORDER BY d::date`, [days, completedOrderStatuses])
   ]);
   const mapDays = rows => rows.map(row => ({date: String(row.day).slice(0, 10), orders: Number(row.orders || 0)}));
   const daysNow = mapDays(current.rows);
