@@ -13,7 +13,34 @@ const issueCategoryKey=t=>{const raw=String(t??'').trim();const value=raw.toLowe
 const reportTypeLabel=t=>issueCategoryLabels[issueCategoryKey(t)];const reportSummary=s=>{const value=String(s??'').trim();return value.length>54?`${value.slice(0,54)}…`:value||'ไม่ระบุรายงาน'};
 const compactText=(value,max=180)=>{const text=String(value??'').replace(/\s+/g,' ').trim();return text.length>max?`${text.slice(0,max)}…`:text};
 const evidenceUrlPattern=/https?:\/\/[^\s"'<>]+/gi;
-const normalizeEvidenceUrl=url=>{const value=String(url??'').replace(/[),.;]+$/,'');if(!/^https?:\/\//i.test(value))return '';try{const parsed=new URL(value);if(parsed.protocol==='http:')parsed.protocol='https:';return parsed.toString()}catch{return ''}};
+const normalizeEvidenceUrl=url=>{
+ let value=String(url??'').trim().replace(/[),.;]+$/,'').replace(/^["'\[]+|["'\]]+$/g,'');
+ if(!value)return '';
+ try{
+  if(/^https?:\/\//i.test(value)){
+   const parsed=new URL(value);
+   if(parsed.protocol==='http:'&&location.protocol==='https:')parsed.protocol='https:';
+   return parsed.toString();
+  }
+  if(value.startsWith('/uploads/')||value.startsWith('uploads/')||value.startsWith('/')){
+   const path=value.startsWith('/')?value:'/'+value;
+   return new URL(path,window.location.origin).toString();
+  }
+  return '';
+ }catch{return '';}
+};
+const parseImageUrls=val=>{
+ if(!val)return [];
+ if(Array.isArray(val))return val.flatMap(parseImageUrls);
+ const s=String(val).trim();
+ if(s.startsWith('[')&&s.endsWith(']')){
+  try{
+   const parsed=JSON.parse(s);
+   if(Array.isArray(parsed))return parsed.flatMap(parseImageUrls);
+  }catch{}
+ }
+ return [s];
+};
 const extractEvidenceUrls=(...values)=>[...new Set(values.flatMap(value=>String(value??'').match(evidenceUrlPattern)||[]).map(normalizeEvidenceUrl).filter(url=>/\.(?:jpe?g|png|webp|gif)(?:$|[?#])/i.test(url)||/\/uploads?\//i.test(url)))];
 const reportDetailText=report=>{const raw=String(report?.originalDetails||report?.user_note||report?.details||report?.description||report?.note||report?.name||'').replace(evidenceUrlPattern,' ').replace(/\s+/g,' ').trim();const match=raw.match(/(?:เหตุผลตรวจสอบสลิป|เหตุผล|รายละเอียด)\s*[:：]\s*(.*?)(?=\s+(?:เวลา|วันที่|สถานะ|ยอด|หลักฐาน|ออเดอร์|order|เลข)|$)/i);return compactText((match?.[1]||raw),180)||'ไม่มีรายละเอียดจากข้อมูลที่ส่งมา'};
 
@@ -98,8 +125,13 @@ function openReport(id){
  currentRecord={type:'report',id,initialStatus:r.status};
  const u=users.find(u=>u.id===r.userId);
  const related=reports.filter(x=>x.id!==r.id&&(x.userId===r.userId||x.orderId&&x.orderId===r.orderId));
- const explicitUrls=(Array.isArray(r.evidenceUrls)?r.evidenceUrls:(r.image_url?[r.image_url]:[])).map(normalizeEvidenceUrl).filter(Boolean);
- const evidenceUrls=[...new Set([...explicitUrls,...extractEvidenceUrls(r.note,r.name,r.details,r.user_note)])];
+ const rawUrls=[
+  ...parseImageUrls(r.evidenceUrls),
+  ...parseImageUrls(r.image_url),
+  ...parseImageUrls(r.imageUrl),
+  ...extractEvidenceUrls(r.note,r.name,r.details,r.user_details,r.user_note)
+ ];
+ const evidenceUrls=[...new Set(rawUrls.map(normalizeEvidenceUrl).filter(Boolean))];
  const evidenceMarkup=evidenceUrls.length?evidenceUrls.map((url,i)=>`<button type="button" class="evidence-thumb" data-evidence="${escape(url)}" aria-label="เปิดดูรูปหลักฐาน ${i+1}"><img src="${escape(url)}" alt="หลักฐาน ${i+1}" style="max-width:100%;max-height:100%;object-fit:contain;border-radius:6px" onerror="this.hidden=true;this.nextElementSibling.textContent='เปิดลิงก์หลักฐานไม่สำเร็จ'"><small>หลักฐาน ${i+1}</small></button>`).join(''):r.evidenceCount?`<div class="read-only-box"><strong>หลักฐาน ${r.evidenceCount} รูป</strong><p>มีหลักฐานแนบมา แต่ไม่พบ URL รูปภาพที่แสดงได้โดยตรง</p></div>`:'<div class="read-only-box"><strong>ไม่มีรูปหลักฐาน</strong></div>';
  
  const reportProgression=['รอตรวจสอบ','กำลังตรวจสอบ','ดำเนินการแล้ว','ปิดเรื่อง'];
@@ -109,9 +141,9 @@ function openReport(id){
  
  const isClosed=r.status==='ปิดเรื่อง';
  const isCompleted=r.status==='ดำเนินการแล้ว';
- const userDetailContent=r.originalDetails||r.user_note||r.details||r.description;
- const reporterText=userDetailContent?compactText(userDetailContent,300):(r.name?`ผู้ใช้แจ้งว่า “${r.name}”`:'ไม่มีรายละเอียดเพิ่มเติมจากผู้รายงาน');
- const adminReviewText=r.reviewNote||r.admin_note||(r.status!=='รอตรวจสอบ'?r.note:'')||'';
+ const userDetailContent=r.user_details||r.details||r.originalDetails||r.user_note||r.description||(r.admin_note?'':r.note);
+ const reporterText=(userDetailContent&&userDetailContent.trim().length>0)?compactText(userDetailContent.trim(),500):(r.name?`ผู้ใช้แจ้งว่า “${r.name}”`:'ไม่มีรายละเอียดเพิ่มเติมจากผู้รายงาน');
+ const adminReviewText=r.admin_note||r.reviewNote||(r.user_details&&r.note!==r.user_details?r.note:'')||'';
 
  const submitBtnText=isClosed?'ปิดเรื่องเรียบร้อยแล้ว':(isCompleted?'ดำเนินการแล้ว (เลือกปิดเรื่องเพื่อบันทึก)':'บันทึกผลรายงาน');
  const submitBtnDisabled=isClosed||isCompleted;
