@@ -155,11 +155,8 @@ function openReport(id){
   ...parseImageUrls(r.evidence),
   ...extractEvidenceUrls(r.note,r.name,r.details,r.user_details,r.user_note,r.description)
  ];
- let evidenceUrls=[...new Set(rawUrls.map(normalizeEvidenceUrl).filter(Boolean))];
- if(!evidenceUrls.length&&Number(r.evidenceCount||0)>0){
-  evidenceUrls=Array.from({length:Number(r.evidenceCount)},()=>'/evidence/report-evidence.png');
- }
- const evidenceMarkup=evidenceUrls.length?evidenceUrls.map((url,i)=>`<button type="button" class="evidence-thumb" data-evidence="${escape(url)}" aria-label="เปิดดูรูปหลักฐาน ${i+1}"><img src="${escape(url)}" alt="หลักฐาน ${i+1}" style="max-width:100%;max-height:100%;object-fit:contain;border-radius:6px" onerror="if(this.src!='/evidence/report-evidence.png'){this.src='/evidence/report-evidence.png';}"><small>หลักฐาน ${i+1}</small></button>`).join(''):'<div class="read-only-box"><strong>ไม่มีรูปหลักฐาน</strong></div>';
+ const evidenceUrls=[...new Set(rawUrls.map(normalizeEvidenceUrl).filter(Boolean))];
+ const evidenceMarkup=evidenceUrls.length?evidenceUrls.map((url,i)=>`<button type="button" class="evidence-thumb" data-evidence="${escape(url)}" aria-label="เปิดดูรูปหลักฐาน ${i+1}"><img src="${escape(url)}" alt="หลักฐาน ${i+1}" style="max-width:100%;max-height:100%;object-fit:contain;border-radius:6px" onerror="this.hidden=true;this.nextElementSibling.textContent='เปิดรูปไม่สำเร็จ'"><small>หลักฐาน ${i+1}</small></button>`).join(''):'<div class="read-only-box"><strong>ไม่มีรูปหลักฐาน</strong></div>';
  
  const reportProgression=['รอตรวจสอบ','กำลังตรวจสอบ','ดำเนินการแล้ว','ปิดเรื่อง'];
  const reportRanks={'รอตรวจสอบ':0,'กำลังตรวจสอบ':1,'ดำเนินการแล้ว':2,'ปิดเรื่อง':3};
