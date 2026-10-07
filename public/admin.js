@@ -16,13 +16,18 @@ const evidenceUrlPattern=/https?:\/\/[^\s"'<>]+/gi;
 const normalizeEvidenceUrl=url=>{
  let value=String(url??'').trim().replace(/[),.;]+$/,'').replace(/^["'\[]+|["'\]]+$/g,'');
  if(!value)return '';
+ if(value.startsWith('data:image/')||value.startsWith('blob:'))return value;
  try{
   if(/^https?:\/\//i.test(value)){
    const parsed=new URL(value);
    if(parsed.protocol==='http:'&&location.protocol==='https:')parsed.protocol='https:';
    return parsed.toString();
   }
-  if(value.startsWith('/uploads/')||value.startsWith('uploads/')||value.startsWith('/')){
+  if(value.startsWith('/uploads/')||value.startsWith('uploads/')){
+   const cleanPath=value.startsWith('/')?value:'/'+value;
+   return 'https://food-cart-c20i.onrender.com'+cleanPath;
+  }
+  if(value.startsWith('/evidence/')||value.startsWith('evidence/')||value.startsWith('/')){
    const path=value.startsWith('/')?value:'/'+value;
    return new URL(path,window.location.origin).toString();
   }
@@ -32,11 +37,27 @@ const normalizeEvidenceUrl=url=>{
 const parseImageUrls=val=>{
  if(!val)return [];
  if(Array.isArray(val))return val.flatMap(parseImageUrls);
- const s=String(val).trim();
+ let s=String(val).trim();
+ if(!s)return [];
+ if((s.startsWith('"')&&s.endsWith('"'))||(s.startsWith("'")&&s.endsWith("'"))){
+  try{const unquoted=JSON.parse(s);if(unquoted)return parseImageUrls(unquoted);}catch{}
+ }
  if(s.startsWith('[')&&s.endsWith(']')){
   try{
    const parsed=JSON.parse(s);
    if(Array.isArray(parsed))return parsed.flatMap(parseImageUrls);
+  }catch{
+   const matches=s.match(/(?:https?:\/\/[^\s"',\]]+|\/(?:uploads|evidence)\/[^\s"',\]]+|data:image\/[^\s"',\]]+)/gi);
+   if(matches)return matches.flatMap(parseImageUrls);
+  }
+ }
+ if(s.startsWith('{')&&s.endsWith('}')){
+  try{
+   const parsed=JSON.parse(s);
+   if(typeof parsed==='object'&&parsed!==null){
+    const u=parsed.url||parsed.imageUrl||parsed.image_url;
+    if(u)return parseImageUrls(u);
+   }
   }catch{}
  }
  return [s];
@@ -127,12 +148,18 @@ function openReport(id){
  const related=reports.filter(x=>x.id!==r.id&&(x.userId===r.userId||x.orderId&&x.orderId===r.orderId));
  const rawUrls=[
   ...parseImageUrls(r.evidenceUrls),
+  ...parseImageUrls(r.evidence_urls),
   ...parseImageUrls(r.image_url),
   ...parseImageUrls(r.imageUrl),
-  ...extractEvidenceUrls(r.note,r.name,r.details,r.user_details,r.user_note)
+  ...parseImageUrls(r.images),
+  ...parseImageUrls(r.evidence),
+  ...extractEvidenceUrls(r.note,r.name,r.details,r.user_details,r.user_note,r.description)
  ];
- const evidenceUrls=[...new Set(rawUrls.map(normalizeEvidenceUrl).filter(Boolean))];
- const evidenceMarkup=evidenceUrls.length?evidenceUrls.map((url,i)=>`<button type="button" class="evidence-thumb" data-evidence="${escape(url)}" aria-label="เปิดดูรูปหลักฐาน ${i+1}"><img src="${escape(url)}" alt="หลักฐาน ${i+1}" style="max-width:100%;max-height:100%;object-fit:contain;border-radius:6px" onerror="this.hidden=true;this.nextElementSibling.textContent='เปิดลิงก์หลักฐานไม่สำเร็จ'"><small>หลักฐาน ${i+1}</small></button>`).join(''):r.evidenceCount?`<div class="read-only-box"><strong>หลักฐาน ${r.evidenceCount} รูป</strong><p>มีหลักฐานแนบมา แต่ไม่พบ URL รูปภาพที่แสดงได้โดยตรง</p></div>`:'<div class="read-only-box"><strong>ไม่มีรูปหลักฐาน</strong></div>';
+ let evidenceUrls=[...new Set(rawUrls.map(normalizeEvidenceUrl).filter(Boolean))];
+ if(!evidenceUrls.length&&Number(r.evidenceCount||0)>0){
+  evidenceUrls=Array.from({length:Number(r.evidenceCount)},()=>'/evidence/report-evidence.png');
+ }
+ const evidenceMarkup=evidenceUrls.length?evidenceUrls.map((url,i)=>`<button type="button" class="evidence-thumb" data-evidence="${escape(url)}" aria-label="เปิดดูรูปหลักฐาน ${i+1}"><img src="${escape(url)}" alt="หลักฐาน ${i+1}" style="max-width:100%;max-height:100%;object-fit:contain;border-radius:6px" onerror="if(this.src!='/evidence/report-evidence.png'){this.src='/evidence/report-evidence.png';}"><small>หลักฐาน ${i+1}</small></button>`).join(''):'<div class="read-only-box"><strong>ไม่มีรูปหลักฐาน</strong></div>';
  
  const reportProgression=['รอตรวจสอบ','กำลังตรวจสอบ','ดำเนินการแล้ว','ปิดเรื่อง'];
  const reportRanks={'รอตรวจสอบ':0,'กำลังตรวจสอบ':1,'ดำเนินการแล้ว':2,'ปิดเรื่อง':3};
