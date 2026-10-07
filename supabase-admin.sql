@@ -90,19 +90,17 @@ create table if not exists public.reports (
   status text not null default 'รอตรวจสอบ' check (status in ('รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง')),
   priority text not null default 'ปกติ' check (priority in ('สูงสุด', 'สูง', 'ปกติ', 'ต่ำ')),
   note text not null default '',
+  user_details text not null default '',
+  admin_note text not null default '',
+  image_url text not null default '',
   evidence_count integer not null default 0 check (evidence_count >= 0),
-  evidence_urls jsonb not null default '[]'::jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
 
--- เก็บ URL หลักฐานจริงจากรายงานเดิมโดยไม่กระทบข้อมูลเดิม
-alter table public.reports
-  add column if not exists evidence_urls jsonb not null default '[]'::jsonb;
-alter table public.reports
-  add column if not exists source_key text;
-create unique index if not exists reports_source_key_idx
-  on public.reports (source_key) where source_key is not null;
+alter table if exists public.reports add column if not exists user_details text not null default '';
+alter table if exists public.reports add column if not exists admin_note text not null default '';
+alter table if exists public.reports add column if not exists image_url text not null default '';
 
 create table if not exists public.notifications (
   notification_id text primary key,
