@@ -4,7 +4,7 @@ const $=s=>document.querySelector(s);
 const escape=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const icon=n=>icons[n]||icons['circle-help'];
 const money=n=>'฿'+Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
-const menu=[['overview','ภาพรวม','layout-dashboard'],['users','ผู้ใช้งาน','users'],['reports','รายงานปัญหา','flag']];
+const menu=[['overview','ภาพรวม','layout-dashboard'],['users','ผู้ใช้งาน','users'],['reports','รายงานปัญหา','flag'],['settings','ตั้งค่าระบบ','settings']];
 const reportNames=['แอปพลิเคชันทำงานผิดปกติ','คำสั่งซื้อมีปัญหา','รายละเอียดเพิ่มเติมเกี่ยวกับการใช้งาน','ชำระเงินแล้วแต่คำสั่งซื้อไม่สมบูรณ์','แอปพลิเคชันแสดงข้อมูลไม่ถูกต้อง','ไม่สามารถเปิดดูร้านค้าได้','ขอความช่วยเหลือจากทีมงาน','ข้อมูลคำสั่งซื้อไม่ตรงกับที่ได้รับ','พบข้อผิดพลาดระหว่างใช้งาน','ต้องการรายงานปัญหาอื่น','การแจ้งเตือนไม่แสดงผล','ไม่สามารถส่งรายงานจากแอปได้'];
 const reporterLabel=t=>t==='Shop'?'ร้านค้า':'ลูกค้า';
 const reporterName=(r,user)=>r.reporterType==='Shop'?(user?.shop||r.shop||user?.name||r.person):r.person;
