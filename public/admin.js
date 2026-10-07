@@ -26,7 +26,7 @@ const shops=['ครัวป้าสุ รถกับข้าว','Coffee o
 const emptyOrderTrend=()=>({days:[],previousDays:[],total:0,previousTotal:0});
 let reports=[];let users=[];let transactions=[];let notifications=[];let history=[];let orderTrends={7:emptyOrderTrend(),30:emptyOrderTrend()};
 let state={page:'overview',query:'',filter:'ทั้งหมด',tab:'ทั้งหมด',pageNumber:1,period:'7',busy:false};let filterOpen=false;let connected=false;let account=null;let currentRecord=null;let confirmHandler=null;let authState='checking';
-function showLogin(show=true){authState=show?'login':'app';const view=document.querySelector('#login-view');if(view)view.hidden=!show;document.body.classList.toggle('auth-required',show);refreshIcons()}
+function showLogin(show=true){authState=show?'login':'app';const view=document.querySelector('#login-view');if(view)view.hidden=!show;document.body.classList.toggle('auth-required',show);refreshIcons();updateProfileUI()}
 const refreshIcons=()=>document.querySelectorAll('[data-icon]').forEach(e=>e.innerHTML=icon(e.dataset.icon));
 const pendingReports=()=>reports.filter(r=>!['ดำเนินการแล้ว','ปิดเรื่อง'].includes(r.status));
 const pendingRefunds=()=>[];
@@ -46,6 +46,38 @@ function reportTable(overview=false){let rows=reports.filter(r=>(state.tab==='�
 function pagination(total,size){return `<div class="pagination">${Array.from({length:Math.ceil(total/size)},(_,i)=>`<button class="${state.pageNumber===i+1?'active':''}" data-pagination="${i+1}" aria-label="หน้า ${i+1}">${i+1}</button>`).join('')}</div>`}
 function empty(text){return `<div class="empty">${icon('search')}<h3>${text}</h3><p>ลองเปลี่ยนคำค้นหาหรือตัวกรอง</p></div>`}
 function overview(){return heading('ภาพรวมระบบ','ยินดีต้อนรับกลับมา ดูแลทุกการเดินทางของร้านค้าคุณได้ที่นี่','',`<button class="btn date-control" data-action="date">${icon('calendar-days')}${periodLabel(state.period)}${icon('chevron-down')}</button>${exportButton()}`)+stats()+`<div class="middle-grid">${chart()}${tasks()}</div>`+reportTable(true)}
+function updateProfileUI(){
+ const name = account?.name || account?.displayName || (connected ? 'ผู้ดูแลระบบ' : 'โหมดทดลองใช้งาน');
+ const email = account?.email || (connected ? 'admin@footcart.local' : 'ยังไม่ได้เข้าสู่ระบบ');
+ const avatarChar = (name || email || 'A').trim().charAt(0).toUpperCase();
+
+ const sideName = $('#side-profile-name');
+ if(sideName) sideName.textContent = name;
+
+ const menuName = $('#admin-menu-name');
+ if(menuName) menuName.textContent = name;
+
+ const menuEmail = $('#admin-menu-email');
+ if(menuEmail) menuEmail.textContent = email;
+
+ const sideAvatar = $('#side-profile-avatar');
+ if(sideAvatar) sideAvatar.textContent = avatarChar;
+
+ const menuAvatar = $('#admin-menu-avatar');
+ if(menuAvatar) menuAvatar.textContent = avatarChar;
+
+ const logoutLink = $('#admin-logout-link');
+ if(logoutLink){
+  if(account || connected){
+   logoutLink.href = '/api/auth/logout';
+   logoutLink.onclick = null;
+  } else {
+   logoutLink.href = '#';
+   logoutLink.onclick = (e)=>{ e.preventDefault(); showLogin(true); };
+  }
+ }
+}
+
 function render(){const found=menu.find(n=>n[0]===state.page);$('#breadcrumb-current').textContent=found?.[1]||({settings:'ตั้งค่าระบบ',notifications:'การแจ้งเตือน'})[state.page];$('#navigation').innerHTML=menu.map(n=>`<button class="nav-item ${state.page===n[0]?'active':''}" data-page="${n[0]}" title="${n[1]}" ${state.page===n[0]?'aria-current="page"':''}>${icon(n[2])}<span class="side-label">${n[1]}</span>${n[3]?`<b>${n[0]==='reports'?pendingReports().length:pendingRefunds().length}</b>`:''}</button>`).join('');$('#main').innerHTML=(state.page==='overview'?overview():renderView())+footer();refreshIcons()}
 function tools(filters,placeholder='ค้นหาชื่อ หมายเลข หรือร้านค้า...'){return `<div class="view-tools"><label class="search-box">${icon('search')}<input id="search-input" aria-label="ค้นหา" placeholder="${placeholder}" value="${escape(state.query)}"></label><select id="view-filter" aria-label="ตัวกรองสถานะ">${['ทั้งหมด',...filters].map(s=>`<option value="${escape(s)}" ${state.filter===s?'selected':''}>${escape(filterLabel(s))}</option>`).join('')}</select></div>`}
 function table(headers,rows,count){return `<section class="panel"><div class="table-scroll"><table><thead><tr>${headers.map(h=>`<th scope="col">${h}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table>${rows.length?'':empty('ไม่พบข้อมูลที่ค้นหา')}</div><div class="table-footer"><span>ทั้งหมด ${count} รายการ</span>${pagination(count,8)}</div></section>`}
