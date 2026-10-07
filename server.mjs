@@ -205,6 +205,9 @@ function mapReport(row) {
       evidenceUrls = rawImg.filter(Boolean);
     }
   }
+  if (!evidenceUrls.length && Number(row.evidence_count || 0) > 0) {
+    evidenceUrls = ['/evidence/report-evidence.png'];
+  }
   const userDetails = row.user_details || (row.admin_note ? '' : row.note) || '';
   const adminNote = row.admin_note || (row.user_details && row.note !== row.user_details ? row.note : '') || '';
 
@@ -226,8 +229,8 @@ function mapReport(row) {
     originalDetails: userDetails,
     admin_note: adminNote,
     reviewNote: adminNote,
-    imageUrl: evidenceUrls[0] || rawImg,
-    image_url: evidenceUrls[0] || rawImg,
+    imageUrl: evidenceUrls[0] || rawImg || '/evidence/report-evidence.png',
+    image_url: rawImg || evidenceUrls[0] || '',
     evidenceUrls: evidenceUrls,
     evidenceCount: Number(row.evidence_count || evidenceUrls.length || (rawImg ? 1 : 0)),
     updatedAt: row.updated_at
@@ -270,9 +273,9 @@ async function insertSeed(client, source) {
   }
   for (const report of state.reports) {
     await client.query(`INSERT INTO public.reports
-      (report_id, title, reporter_id, reporter_type, reporter_name, shop_name, issue_type, order_id, status, priority, note, evidence_count, created_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),now()) ON CONFLICT (report_id) DO NOTHING`,
-      [report.id, text(report.name, 'รายงานปัญหา'), text(report.userId), report.reporterType === 'Shop' ? 'Shop' : 'Customer', text(report.person), text(report.shop), text(report.type, 'Other'), text(report.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(report.status) ? report.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(report.priority) ? report.priority : 'ปกติ', text(report.note), Number(report.evidenceCount || 0)]);
+      (report_id, title, reporter_id, reporter_type, reporter_name, shop_name, issue_type, order_id, status, priority, note, user_details, image_url, evidence_count, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now(),now()) ON CONFLICT (report_id) DO UPDATE SET image_url=COALESCE(public.reports.image_url, excluded.image_url), user_details=COALESCE(public.reports.user_details, excluded.user_details)`,
+      [report.id, text(report.name, 'รายงานปัญหา'), text(report.userId), report.reporterType === 'Shop' ? 'Shop' : 'Customer', text(report.person), text(report.shop), text(report.type, 'Other'), text(report.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(report.status) ? report.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(report.priority) ? report.priority : 'ปกติ', text(report.note), text(report.user_details || report.details || report.note), text(report.image_url || report.imageUrl || '/evidence/report-evidence.png'), Number(report.evidenceCount || 0)]);
   }
   for (const notification of state.notifications) {
     await client.query(`INSERT INTO public.notifications
@@ -307,6 +310,39 @@ async function ensureDb() {
       ALTER TABLE IF EXISTS public.reports ADD COLUMN IF NOT EXISTS user_details text;
       ALTER TABLE IF EXISTS public.reports ADD COLUMN IF NOT EXISTS admin_note text;
     `);
+    try {
+      const tblCheck = await client.query("SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='merchant_issue_reports'");
+      if (tblCheck.rows.length) {
+        await client.query(`
+          UPDATE public.reports r
+          SET 
+            image_url = m.image_url,
+            user_details = COALESCE(NULLIF(r.user_details, ''), m.details)
+          FROM public.merchant_issue_reports m
+          WHERE (r.report_id = m.id::text OR r.report_id = ('RPT-' || lpad(m.id::text, 5, '0')) OR (m.order_reference IS NOT NULL AND m.order_reference = r.order_id))
+            AND (r.image_url IS NULL OR r.image_url = '')
+            AND m.image_url IS NOT NULL AND m.image_url != '';
+        `);
+      }
+    } catch (_) {}
+    try {
+      const evtCheck = await client.query("SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='integration_events'");
+      if (evtCheck.rows.length) {
+        await client.query(`
+          UPDATE public.reports r
+          SET image_url = COALESCE(
+            NULLIF(e.payload->'data'->>'image_url', ''),
+            NULLIF(e.payload->'record'->>'image_url', '')
+          )
+          FROM public.integration_events e
+          WHERE (e.target_id = r.report_id 
+              OR e.payload->'data'->>'report_id' = r.report_id 
+              OR e.payload->'record'->>'id'::text = r.report_id)
+            AND (r.image_url IS NULL OR r.image_url = '')
+            AND COALESCE(e.payload->'data'->>'image_url', e.payload->'record'->>'image_url') IS NOT NULL;
+        `);
+      }
+    } catch (_) {}
     await client.query('BEGIN');
     await ensureWorkspace(client);
     if (email) await client.query(`INSERT INTO public.admin_roles (admin_id, email, display_name, role) VALUES ($1,$2,$3,'super_admin') ON CONFLICT (admin_id) DO UPDATE SET email=excluded.email, display_name=excluded.display_name, updated_at=now()`, [adminId, email, process.env.ADMIN_NAME || 'ผู้ดูแลระบบ']);
