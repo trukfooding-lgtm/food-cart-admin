@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import bcrypt from 'bcryptjs';
 import pg from 'pg';
+import {createInitialState} from './public/sample-data.js';
 import {applyAction} from './public/operations.js';
 
 const {Pool} = pg;
@@ -15,18 +16,10 @@ const sessionSecret = String(process.env.SESSION_SECRET || '');
 const supabaseUrl = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const supabasePublishableKey = String(process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || '');
 const webhookSecret = String(process.env.FOOD_CART_WEBHOOK_SECRET || '');
-const foodCartBackendUrl = String(process.env.FOOD_CART_BACKEND_URL || '').replace(/\/$/, '');
-// Evidence uploaded by the app is stored as /uploads/... paths. Keep a safe
-// public backend fallback so old reports remain viewable when the optional
-// environment variable is not present on the admin service.
-const evidenceBackendUrl = foodCartBackendUrl || 'https://food-cart-c20i.onrender.com';
-const foodCartAdminSecret = String(process.env.FOOD_CART_ADMIN_SECRET || '');
-const foodCartAppDatabaseUrl = String(process.env.FOOD_CART_APP_DATABASE_URL || '').trim();
 const adminId = `env:${email || 'administrator'}`;
 const workspaceId = 'standalone-admin';
 const pool = process.env.DATABASE_URL ? new Pool({connectionString: process.env.DATABASE_URL, ssl: {rejectUnauthorized: false}}) : null;
-const appPool = foodCartAppDatabaseUrl ? new Pool({connectionString: foodCartAppDatabaseUrl, ssl: {rejectUnauthorized: false}}) : null;
-let memory = {payload: normalizeSnapshot({}), revision: 0};
+let memory = {payload: normalizeSnapshot(createInitialState()), revision: 0};
 
 app.use(express.json({limit: '256kb', verify: (req, _res, buf) => { req.rawBody = Buffer.from(buf); }}));
 app.use(cookieParser());
@@ -37,172 +30,14 @@ const now = () => new Date().toISOString();
 const text = (value, fallback = '') => String(value ?? fallback).trim();
 const validText = (value, min, max) => typeof value === 'string' && value.trim().length >= min && value.trim().length <= max;
 const safeDate = (value) => value ? new Date(value) : new Date();
-const reportTimeZone = 'Asia/Bangkok';
-const completedOrderStatuses = Object.freeze(['รับอาหารสำเร็จแล้ว', 'สำเร็จ', 'รับอาหารแล้ว', 'เสร็จสิ้น']);
-const displayTime = (value) => safeDate(value).toLocaleTimeString('th-TH', {timeZone: reportTimeZone, hour: '2-digit', minute: '2-digit', hour12: false});
+const displayTime = (value) => safeDate(value).toLocaleTimeString('th-TH', {hour: '2-digit', minute: '2-digit'});
 const displayDate = (value) => safeDate(value).toLocaleDateString('th-TH', {day: 'numeric', month: 'short', year: 'numeric'});
-const displayDateTime = (value) => {
-  if (!value) return '';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '';
-  return `${date.toLocaleDateString('th-TH', {timeZone: reportTimeZone, day: 'numeric', month: 'short', year: 'numeric'})} · ${date.toLocaleTimeString('th-TH', {timeZone: reportTimeZone, hour: '2-digit', minute: '2-digit', hour12: false})}`;
-};
-const normalizeEvidenceUrls = (value) => {
-  let values = value;
-  if (typeof values === 'string') {
-    const raw = values.trim();
-    if (!raw) return [];
-    try {
-      const parsed = JSON.parse(raw);
-      values = Array.isArray(parsed) ? parsed : [parsed];
-    } catch {
-      values = [raw];
-    }
-  }
-  if (!Array.isArray(values)) values = values == null ? [] : [values];
-  return values
-    .map((item) => text(item))
-    .filter((url) => /^(https?:\/\/|\/)/i.test(url))
-    .map((url) => /^\//.test(url) ? `${evidenceBackendUrl}${url}` : url);
-};
-const normalizeAdminReportId = (data) => {
-  const reportId = text(data?.report_id || data?.id);
-  if (data?.reporter_type === 'Customer' && /^\d+$/.test(reportId)) return `customer:${reportId}`;
-  return reportId;
-};
-const sourceReportReference = (reportId, sourceKey = '') => {
-  const source = text(sourceKey).match(/^(app_issue_reports|merchant_issue_reports):(\d+)$/i);
-  if (source) return {table: source[1].toLowerCase(), id: Number(source[2])};
-  const value = text(reportId);
-  const customerReport = value.match(/^customer:(\d+)$/i);
-  if (customerReport) return {table: 'app_issue_reports', id: Number(customerReport[1])};
-  const numericId = Number(value);
-  return Number.isInteger(numericId) ? {id: numericId} : null;
-};
-const sourceReportStatus = (status) => {
-  const value = text(status);
-  const mapped = {
-    PENDING: 'รอตรวจสอบ',
-    IN_REVIEW: 'กำลังตรวจสอบ',
-    INVESTIGATING: 'กำลังตรวจสอบ',
-    RESOLVED: 'ดำเนินการแล้ว',
-    CLOSED: 'ปิดเรื่อง'
-  }[value.toUpperCase()];
-  return mapped || (['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(value) ? value : 'รอตรวจสอบ');
-};
-const reportPriority = (...values) => {
-  const value = values.map(item => text(item)).join(' ').toLowerCase();
-  if (/(สลิปปลอม|ปลอม|ไม่แท้|สลิปไม่|ไม่ผ่านการตรวจสอบ|ทุจริต|หลอกลวง|fraud|fake\s*slip|slip[_\s-]*mismatch|mismatch.*slip|security|ความปลอดภัย|ผิดปกติ)/i.test(value)) return 'สูงสุด';
-  if (/(คืนเงิน|ไม่คืนเงิน|refund|payment|ชำระ|สลิป|order|ออเดอร์|คำสั่งซื้อ|ยอดเงิน|เงินไม่เข้า|รับเงิน|รับอาหาร|ไม่มารับอาหาร)/i.test(value)) return 'สูง';
-  if (/(ข้อเสนอ|แนะนำ|ปรับปรุง|suggest|feedback|รายละเอียดเพิ่มเติม|ขอความช่วยเหลือ|รายงานปัญหาอื่น|other)/i.test(value)) return 'ต่ำ';
-  return 'ปกติ';
-};
 const sign = (value, secret = sessionSecret || 'development-only-secret') => crypto.createHmac('sha256', secret).update(value).digest('base64url');
 const issueSession = (loginEmail = email) => {
   const exp = Date.now() + 8 * 60 * 60 * 1000;
   const body = `${loginEmail}|${exp}`;
   return `${body}.${sign(body)}`;
 };
-
-async function syncAccountStatus(action, admin, eventId) {
-  if (!foodCartBackendUrl || !foodCartAdminSecret) throw new Error('ยังไม่ได้ตั้งค่าการเชื่อมต่อ Backend สำหรับสถานะบัญชี');
-  const role = action.role === 'Shop' ? 'Shop' : 'Customer';
-  const accountType = role === 'Shop' ? 'merchant' : 'customer';
-  const accountId = Number(externalUserId(action.id));
-  if (!Number.isInteger(accountId) || accountId <= 0) throw new Error('รหัสบัญชีไม่ถูกต้อง');
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
-  try {
-    const response = await fetch(`${foodCartBackendUrl}/api/internal/account-status`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-foodcart-admin-secret': foodCartAdminSecret
-      },
-      body: JSON.stringify({
-        event_id: eventId,
-        user_id: `${accountType}:${accountId}`,
-        account_id: accountId,
-        role,
-        status: action.status,
-        reason: action.reason.trim(),
-        changed_by: admin.name
-      }),
-      signal: controller.signal
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok || payload.success !== true) throw new Error(payload.message || 'Backend ไม่สามารถบันทึกสถานะบัญชีได้');
-    return payload;
-  } catch (error) {
-    if (error?.name === 'AbortError') throw new Error('Backend ไม่ตอบสนองภายในเวลาที่กำหนด');
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function syncReportStatusToApp({reportId, sourceKey, reporterType, status, note, previousStatus}) {
-  if (previousStatus === status) return {changed: false, recipients: []};
-  if (!appPool) throw new Error('ยังไม่ได้ตั้งค่า FOOD_CART_APP_DATABASE_URL สำหรับส่งแจ้งเตือนไปยังลูกค้าและร้านค้า');
-
-  const sourceReference = sourceReportReference(reportId, sourceKey);
-  if (!sourceReference) throw new Error('รหัสรายงานไม่ถูกต้องสำหรับการส่งแจ้งเตือน');
-  const numericReportId = sourceReference.id;
-
-  const client = await appPool.connect();
-  try {
-    await client.query('BEGIN');
-    const preferredTables = sourceReference.table ? [sourceReference.table] : reporterType === 'Shop'
-      ? ['merchant_issue_reports', 'app_issue_reports']
-      : ['app_issue_reports', 'merchant_issue_reports'];
-    let source = null;
-    for (const table of preferredTables) {
-      const result = table === 'app_issue_reports'
-        ? await client.query(`SELECT id, sender_type, customer_id, merchant_id, order_reference
-            FROM public.app_issue_reports WHERE id=$1 LIMIT 1`, [numericReportId])
-        : await client.query(`SELECT id, 'MERCHANT' AS sender_type, NULL::integer AS customer_id, merchant_id, order_reference
-            FROM public.merchant_issue_reports WHERE id=$1 LIMIT 1`, [numericReportId]);
-      if (result.rows[0]) { source = {table, ...result.rows[0]}; break; }
-    }
-    if (!source) throw new Error(`ไม่พบรายงาน #${reportId} ในฐานข้อมูลแอป`);
-
-    let customerId = source.customer_id == null ? null : Number(source.customer_id);
-    let merchantId = source.merchant_id == null ? null : Number(source.merchant_id);
-    if (source.order_reference) {
-      const order = await client.query(`SELECT customer_id, merchant_id
-        FROM public.orders WHERE id::text=$1 LIMIT 1`, [String(source.order_reference)]);
-      if (order.rows[0]) {
-        customerId ??= order.rows[0].customer_id == null ? null : Number(order.rows[0].customer_id);
-        merchantId ??= order.rows[0].merchant_id == null ? null : Number(order.rows[0].merchant_id);
-      }
-    }
-
-    const title = `รายงาน #${reportId} อัปเดตสถานะ`;
-    const body = `แอดมินเปลี่ยนสถานะรายงานเป็น “${status}”${note.trim() ? `\n${note.trim()}` : ''}`;
-    const recipients = [];
-    if (customerId != null) {
-      await client.query(`INSERT INTO public.notifications (user_id, title, body)
-        VALUES ($1,$2,$3)`, [customerId, title, body]);
-      recipients.push(`customer:${customerId}`);
-    }
-    if (merchantId != null) {
-      const sourceId = `report:${reportId}:status:${status}`;
-      await client.query(`INSERT INTO public.merchant_notifications
-        (merchant_id, source_type, source_id, title, message, event_at)
-        VALUES ($1,'report_status',$2,$3,$4,now())
-        ON CONFLICT (merchant_id, source_type, source_id) DO NOTHING`,
-      [merchantId, sourceId, title, body]);
-      recipients.push(`merchant:${merchantId}`);
-    }
-    await client.query('COMMIT');
-    return {changed: true, recipients};
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw error;
-  } finally {
-    client.release();
-  }
-}
 
 async function findAdmin(loginEmail) {
   const normalized = text(loginEmail).toLowerCase();
@@ -243,89 +78,6 @@ async function requireAdmin(req, res, next) {
 
 const can = (admin, permission) => admin?.role === 'super_admin' || (permission === 'reports' && admin?.role === 'reviewer') || (permission === 'users' && admin?.role === 'user_manager');
 
-const suspensionMarkers = Object.freeze({
-  fakeSlip: '[ยืนยันสลิปปลอม]',
-  merchantNotRefunded: '[ยืนยันไม่คืนเงิน]',
-  merchantRefunded: '[ยืนยันคืนเงินแล้ว]'
-});
-const suspensionPolicies = Object.freeze({
-  fake_slip: {roles: ['Customer'], permanent: true},
-  merchant_no_refund: {roles: ['Shop'], permanent: true},
-  inappropriate_behavior: {roles: ['Customer', 'Shop'], temporary: true}
-});
-const completedReportStatuses = new Set(['ดำเนินการแล้ว', 'ปิดเรื่อง']);
-
-function externalUserId(userId) {
-  const value = text(userId);
-  const separator = value.indexOf(':');
-  return separator >= 0 ? value.slice(separator + 1) : value;
-}
-
-function hasReportEvidence(row) {
-  return Number(row.evidence_count || 0) > 0 || normalizeEvidenceUrls(row.evidence_urls).length > 0;
-}
-
-function hasOnlyMarker(note, marker) {
-  const markers = Object.values(suspensionMarkers).filter((value) => note.includes(value));
-  return markers.length === 1 && markers[0] === marker;
-}
-
-async function findSuspensionEvidence(client, user, reasonType) {
-  const targetId = externalUserId(user.user_id);
-  const isShop = user.role === 'Shop';
-  const reporterType = isShop ? 'Customer' : 'Shop';
-  const marker = isShop ? suspensionMarkers.merchantNotRefunded : suspensionMarkers.fakeSlip;
-  const result = await client.query(`
-    SELECT r.report_id, r.status, r.note, r.order_id, r.evidence_count, r.evidence_urls,
-           r.reporter_type, o.customer_id, o.merchant_id
-    FROM public.reports r
-    LEFT JOIN public.app_orders o
-      ON o.order_id = r.order_id
-      OR o.order_id = regexp_replace(r.order_id, '^ORD-', '')
-    WHERE r.status = ANY($1::text[])
-      AND r.reporter_type = $2
-      AND r.order_id IS NOT NULL
-      AND (
-        ($3 = 'Shop' AND o.merchant_id::text = $4)
-        OR ($3 = 'Customer' AND o.customer_id::text = $4)
-      )
-    ORDER BY r.updated_at DESC, r.created_at DESC
-  `, [Array.from(completedReportStatuses), reporterType, user.role, targetId]);
-
-  const evidence = result.rows.find((row) => reasonType === 'inappropriate_behavior'
-    ? true
-    : hasReportEvidence(row) && hasOnlyMarker(text(row.note), marker));
-  if (evidence) return evidence;
-
-  if (reasonType === 'inappropriate_behavior') {
-    throw new Error('ยังระงับบัญชีไม่ได้ ต้องมีรายงานพฤติกรรมที่ตรวจสอบแล้วและเชื่อมโยงกับคำสั่งซื้อ');
-  }
-  if (isShop) {
-    throw new Error('ยังระงับร้านค้าไม่ได้ ต้องมีรายงานลูกค้าที่ตรวจสอบแล้ว ระบุ [ยืนยันไม่คืนเงิน] พร้อมเลขออเดอร์และหลักฐาน');
-  }
-  throw new Error('ยังระงับลูกค้าไม่ได้ ต้องมีรายงานจากร้านค้าที่ตรวจสอบแล้ว ระบุ [ยืนยันสลิปปลอม] พร้อมเลขออเดอร์และหลักฐาน');
-}
-
-function buildSuspensionPlan(action, user) {
-  const policy = suspensionPolicies[text(action.reasonType)];
-  if (!policy || !policy.roles.includes(user.role)) throw new Error('ประเภทเหตุผลไม่ตรงกับประเภทบัญชี');
-  const reason = text(action.reason);
-  if (!validText(reason, 5, 1000)) throw new Error('เหตุผลบัญชีไม่ถูกต้อง');
-  if (policy.temporary) {
-    const durationDays = Number(action.durationDays);
-    if (![7, 14, 21, 30].includes(durationDays)) throw new Error('การระงับพฤติกรรมต้องเลือก 7, 14, 21 หรือ 30 วัน');
-    const until = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000);
-    return {
-      reasonType: text(action.reasonType),
-      durationDays,
-      until: until.toISOString(),
-      effectiveReason: `${reason}\nระงับชั่วคราวถึง: ${displayDateTime(until)}`
-    };
-  }
-  if (action.durationDays != null) throw new Error('กรณีนี้ต้องเป็นการระงับโดยไม่มีกำหนด');
-  return {reasonType: text(action.reasonType), durationDays: null, until: null, effectiveReason: reason};
-}
-
 function requireWebhook(req, res, next) {
   if (!webhookSecret) return json(res, {error: 'ยังไม่ได้ตั้งค่า FOOD_CART_WEBHOOK_SECRET'}, 503);
   const directSecret = String(req.get('x-foodcart-webhook-secret') || '').trim();
@@ -341,53 +93,29 @@ function normalizeSupabaseWebhook(payload) {
   const operation = text(payload?.type).toUpperCase();
   const row = payload?.record && typeof payload.record === 'object' ? payload.record : {};
   const id = text(row.id || row.customer_id || row.user_id || row.order_id || row.notification_id);
-  if (text(payload?.schema, 'public') !== 'public' || !id) return null;
+  if (text(payload?.schema, 'public') !== 'public' || !id || operation === 'DELETE') return null;
   const updatedAt = text(row.updated_at || row.created_at || new Date().toISOString());
   const eventId = `supabase:${table}:${operation}:${id}:${updatedAt}`;
-  if (table === 'customer') {
-    const userId = `customer:${row.customer_id || id}`;
-    if (operation === 'DELETE') return {event_id: eventId, event_type: 'user.delete', data: {user_id: userId, role: 'Customer', source_updated_at: updatedAt}};
-    return {event_id: eventId, event_type: 'user.upsert', data: {
-      user_id: userId, display_name: row.name_surname, email: row.email,
-      role: 'Customer', phone: row.phone, source_updated_at: updatedAt
-    }};
-  }
-  if (table === 'merchant') {
-    const userId = `merchant:${row.id || id}`;
-    if (operation === 'DELETE') return {event_id: eventId, event_type: 'user.delete', data: {user_id: userId, role: 'Shop', source_updated_at: updatedAt}};
-    return {event_id: eventId, event_type: 'user.upsert', data: {
-      user_id: userId, display_name: row.name, email: row.email, role: 'Shop',
-      shop_name: row.name, phone: row.store_phone, category: row.type, line_id: row.line_id,
-      facebook_url: row.facebook_url, source_updated_at: updatedAt
-    }};
-  }
+  if (table === 'customer') return {event_id: eventId, event_type: 'user.upsert', data: {
+    user_id: row.customer_id || id, display_name: row.name_surname, email: row.email,
+    role: 'Customer', phone: row.phone, source_updated_at: updatedAt
+  }};
+  if (table === 'merchant') return {event_id: eventId, event_type: 'user.upsert', data: {
+    user_id: row.id || id, display_name: row.name, email: row.email, role: 'Shop',
+    shop_name: row.name, phone: row.store_phone, category: row.type, line_id: row.line_id,
+    facebook_url: row.facebook_url, latitude: row.latitude, longitude: row.longitude,
+    source_updated_at: updatedAt
+  }};
   if (table === 'orders') return {event_id: eventId, event_type: 'order.upsert', data: {
     order_id: row.id || id, customer_id: row.customer_id, merchant_id: row.merchant_id,
     total_amount: row.total_price, status: row.status, created_at: row.created_at,
     source_updated_at: updatedAt
   }};
   if (table === 'merchant_issue_reports') return {event_id: eventId, event_type: operation === 'INSERT' ? 'report.created' : 'report.updated', data: {
-    report_id: row.id || id, title: row.issue_type, reporter_id: row.merchant_id == null ? null : `merchant:${row.merchant_id}`,
-    reporter_name: row.reporter_name || row.merchant_name || row.shop_name,
-    shop_name: row.shop_name || row.merchant_name,
+    report_id: row.id || id, title: row.issue_type, reporter_id: row.merchant_id,
     reporter_type: 'Shop', issue_type: row.issue_type, order_id: row.order_reference,
     note: row.details, status: row.status, created_at: row.created_at, source_updated_at: updatedAt,
-    evidence_urls: normalizeEvidenceUrls(row.image_url),
-    evidence_count: normalizeEvidenceUrls(row.image_url).length
-  }};
-  if (table === 'app_issue_reports') return {event_id: eventId, event_type: operation === 'INSERT' ? 'report.created' : 'report.updated', data: {
-    report_id: String(row.sender_type || '').toUpperCase() === 'MERCHANT' ? (row.id || id) : `customer:${row.id || id}`,
-    title: row.issue_type,
-    reporter_id: row.sender_type === 'MERCHANT'
-      ? (row.merchant_id == null ? null : `merchant:${row.merchant_id}`)
-      : (row.customer_id == null ? null : `customer:${row.customer_id}`),
-    reporter_name: row.reporter_name || row.customer_name || row.merchant_name,
-    shop_name: row.shop_name || row.merchant_name,
-    reporter_type: String(row.sender_type || '').toUpperCase() === 'MERCHANT' ? 'Shop' : 'Customer',
-    issue_type: row.issue_type, order_id: row.order_reference,
-    note: row.admin_note || row.details, status: row.status, created_at: row.created_at, source_updated_at: updatedAt,
-    evidence_urls: normalizeEvidenceUrls(row.image_url),
-    evidence_count: normalizeEvidenceUrls(row.image_url).length
+    evidence_count: row.image_url ? 1 : 0
   }};
   if (table === 'notifications' || table === 'merchant_notifications') return {event_id: eventId, event_type: 'notification.created', data: {
     notification_id: row.id || id, recipient_id: row.user_id || row.customer_id || row.merchant_id,
@@ -403,10 +131,6 @@ function normalizeSnapshot(input) {
     reports: Array.isArray(input?.reports) ? input.reports : [],
     notifications: (Array.isArray(input?.notifications) ? input.notifications : []).filter((notification) => !/(refund|payment gateway|ธุรกรรม|คืนเงิน)/i.test(`${notification?.title || ''} ${notification?.body || ''}`)),
     history: Array.isArray(input?.history) ? input.history : [],
-    orderTrends: input?.orderTrends && typeof input.orderTrends === 'object' ? input.orderTrends : {
-      7: {days: [], previousDays: [], total: 0, previousTotal: 0},
-      30: {days: [], previousDays: [], total: 0, previousTotal: 0}
-    },
     // Payment Gateway / transaction / refund UI ถูกปิดไว้ชั่วคราวตามขอบเขตที่อนุมัติ
     transactions: []
   };
@@ -420,8 +144,6 @@ function mapUser(row) {
     role: row.role,
     status: row.status,
     reason: row.status_reason || '',
-    suspensionUntil: row.suspension_until || '',
-    suspensionReasonType: row.suspension_reason_type || '',
     joined: row.joined_at ? displayDate(row.joined_at) : '',
     shop: row.shop_name || '—',
     phone: row.phone || '',
@@ -433,12 +155,7 @@ function mapUser(row) {
   };
 }
 
-const refundTrackingStatuses = Object.freeze(['รอติดต่อร้านค้า', 'แจ้งร้านค้าแล้ว', 'รอหลักฐานการคืนเงิน', 'ส่งหลักฐานแล้ว', 'ยืนยันคืนเงินแล้ว', 'เกินกำหนด']);
-const refundDeadlineDays = 2;
-
-function mapReport(row, sourceReport = {}, reviewNote = '', refundTracking = null) {
-  const storedEvidenceUrls = normalizeEvidenceUrls(row.evidence_urls);
-  const evidenceUrls = storedEvidenceUrls.length ? storedEvidenceUrls : normalizeEvidenceUrls(sourceReport.evidenceUrls);
+function mapReport(row) {
   return {
     id: row.report_id,
     name: row.title,
@@ -450,95 +167,11 @@ function mapReport(row, sourceReport = {}, reviewNote = '', refundTracking = nul
     status: row.status,
     priority: row.priority,
     time: displayTime(row.created_at),
-    reportedAt: displayDateTime(row.created_at),
     userId: row.reporter_id || '',
-    note: text(reviewNote) || row.note || '',
-    originalDetails: text(sourceReport.details) || (reviewNote ? '' : text(row.note)),
-    reviewNote: text(reviewNote),
-    evidenceCount: Math.max(Number(row.evidence_count || 0), evidenceUrls.length),
-    evidenceUrls,
-    refundTracking: refundTracking || null,
+    note: row.note || '',
+    evidenceCount: Number(row.evidence_count || 0),
     updatedAt: row.updated_at
   };
-}
-
-async function sourceReportData(reportRows) {
-  if (!appPool) return new Map();
-  const ids = reportRows.map((row) => sourceReportReference(row.report_id)?.id).filter((id) => Number.isInteger(id));
-  if (!ids.length) return new Map();
-  const sourceReportsBySourceKey = new Map();
-  for (const table of ['app_issue_reports', 'merchant_issue_reports']) {
-    try {
-      const result = await appPool.query(`SELECT id, image_url, details, order_reference FROM public.${table} WHERE id = ANY($1::int[])`, [ids]);
-      for (const row of result.rows) {
-        const urls = normalizeEvidenceUrls(row.image_url);
-        const sourceKey = `${table}:${row.id}`;
-        const previous = sourceReportsBySourceKey.get(sourceKey) || {};
-        sourceReportsBySourceKey.set(sourceKey, {
-          evidenceUrls: urls.length ? urls : previous.evidenceUrls || [],
-          details: text(row.details) || previous.details || '',
-          orderReference: text(row.order_reference) || previous.orderReference || ''
-        });
-      }
-    } catch (error) {
-      console.warn(`ไม่สามารถอ่านข้อมูลรายงานจาก ${table}:`, error.message);
-    }
-  }
-
-  const merchantReports = reportRows
-    .map((report) => {
-      const sourceReference = sourceReportReference(report.report_id);
-      const sourceTable = sourceReference?.table || (report.reporter_type === 'Shop' ? 'merchant_issue_reports' : 'app_issue_reports');
-      const sourceId = sourceReference?.id;
-      const source = sourceReportsBySourceKey.get(`${sourceTable}:${sourceId}`);
-      return sourceTable === 'merchant_issue_reports' && source?.orderReference
-        ? {sourceKey: `${sourceTable}:${sourceId}`, orderReference: source.orderReference}
-        : null;
-    })
-    .filter(Boolean);
-  const orderKeys = [...new Set(merchantReports.flatMap(({orderReference}) => {
-    const value = text(orderReference);
-    const numericValue = value.replace(/^ORD[-_#]?/i, '');
-    return [value, numericValue].filter(Boolean);
-  }))];
-  if (orderKeys.length) {
-    try {
-      const slips = await appPool.query(`SELECT order_id, slip_url
-        FROM public.order_slips
-        WHERE order_id = ANY($1::text[])
-        ORDER BY created_at DESC`, [orderKeys]);
-      const evidenceByOrder = new Map();
-      for (const slip of slips.rows) {
-        const urls = normalizeEvidenceUrls(slip.slip_url);
-        if (!urls.length) continue;
-        const key = text(slip.order_id);
-        const existing = evidenceByOrder.get(key) || [];
-        evidenceByOrder.set(key, [...new Set([...existing, ...urls])]);
-      }
-      for (const {sourceKey, orderReference} of merchantReports) {
-        const value = text(orderReference);
-        const numericValue = value.replace(/^ORD[-_#]?/i, '');
-        const fallbackUrls = [...new Set([
-          ...(evidenceByOrder.get(value) || []),
-          ...(evidenceByOrder.get(numericValue) || [])
-        ])];
-        const source = sourceReportsBySourceKey.get(sourceKey);
-        if (source && !source.evidenceUrls?.length && fallbackUrls.length) source.evidenceUrls = fallbackUrls;
-      }
-    } catch (error) {
-      console.warn('ไม่สามารถอ่านหลักฐานสลิปจากคำสั่งซื้อ:', error.message);
-    }
-  }
-
-  const sourceReports = new Map();
-  for (const report of reportRows) {
-    const sourceReference = sourceReportReference(report.report_id);
-    const sourceId = sourceReference?.id;
-    const sourceTable = sourceReference?.table || (report.reporter_type === 'Shop' ? 'merchant_issue_reports' : 'app_issue_reports');
-    const source = sourceReportsBySourceKey.get(`${sourceTable}:${sourceId}`);
-    if (source) sourceReports.set(String(report.report_id), source);
-  }
-  return sourceReports;
 }
 
 function mapNotification(row) {
@@ -550,17 +183,12 @@ function mapNotification(row) {
     priority: row.priority,
     read: Boolean(row.is_read),
     recipient: row.recipient_id || '',
-    delivery: row.delivery_status,
-    sourceType: row.source_type || '',
-    sourceId: row.source_id || '',
-    reporterType: row.reporter_type || '',
-    reporterName: row.reporter_name || row.shop_name || '',
-    reportedAt: row.report_created_at ? displayDateTime(row.report_created_at) : ''
+    delivery: row.delivery_status
   };
 }
 
 function mapHistory(row) {
-  return {id: row.action_id, action: row.action_type, target: row.target_id, reason: row.reason || '', time: row.created_at};
+  return {id: row.action_id, action: row.action_type, target: row.target_id, time: row.created_at};
 }
 
 async function readSchema() {
@@ -572,6 +200,43 @@ async function ensureWorkspace(client) {
     VALUES ($1, '{}'::jsonb, 0) ON CONFLICT (user_id) DO NOTHING`, [workspaceId]);
 }
 
+async function insertSeed(client, source) {
+  const state = normalizeSnapshot(source);
+  for (const user of state.users) {
+    await client.query(`INSERT INTO public.app_users
+      (user_id, display_name, email, role, status, status_reason, shop_name, phone, category, line_id, facebook_url, latitude, longitude, joined_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now()) ON CONFLICT (user_id) DO NOTHING`,
+      [user.id, text(user.name, 'ไม่ระบุชื่อ'), text(user.email), user.role === 'Shop' ? 'Shop' : 'Customer', user.status === 'ระงับบัญชี' ? 'ระงับบัญชี' : 'ใช้งานปกติ', text(user.reason), text(user.shop), text(user.phone), text(user.category), text(user.lineId), text(user.facebook), user.lat === '' ? null : Number(user.lat), user.lng === '' ? null : Number(user.lng)]);
+  }
+  for (const report of state.reports) {
+    await client.query(`INSERT INTO public.reports
+      (report_id, title, reporter_id, reporter_type, reporter_name, shop_name, issue_type, order_id, status, priority, note, evidence_count, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),now()) ON CONFLICT (report_id) DO NOTHING`,
+      [report.id, text(report.name, 'รายงานปัญหา'), text(report.userId), report.reporterType === 'Shop' ? 'Shop' : 'Customer', text(report.person), text(report.shop), text(report.type, 'Other'), text(report.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(report.status) ? report.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(report.priority) ? report.priority : 'ปกติ', text(report.note), Number(report.evidenceCount || 0)]);
+  }
+  for (const notification of state.notifications) {
+    await client.query(`INSERT INTO public.notifications
+      (notification_id, recipient_id, title, body, priority, is_read, delivery_status, created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT (notification_id) DO NOTHING`,
+      [notification.id, text(notification.recipient) || null, text(notification.title, 'การแจ้งเตือน'), text(notification.body), ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(notification.priority) ? notification.priority : 'ปกติ', Boolean(notification.read), text(notification.delivery, 'รอส่ง')]);
+  }
+  for (const action of state.history) {
+    await client.query(`INSERT INTO public.admin_actions
+      (action_id, admin_id, action_type, target_type, target_id, reason, created_at)
+      VALUES ($1,$2,$3,'legacy',$4,$5,now()) ON CONFLICT (action_id) DO NOTHING`,
+      [action.id || crypto.randomUUID(), adminId, text(action.action, 'การดำเนินการเดิม'), text(action.target, 'ไม่ระบุ'), text(action.action)]);
+  }
+}
+
+async function seedIfEmpty(client) {
+  const count = await client.query('SELECT (SELECT count(*) FROM public.app_users) AS users, (SELECT count(*) FROM public.reports) AS reports, (SELECT count(*) FROM public.notifications) AS notifications');
+  const empty = Number(count.rows[0].users) === 0 && Number(count.rows[0].reports) === 0 && Number(count.rows[0].notifications) === 0;
+  if (!empty) return;
+  const legacy = await client.query('SELECT payload FROM public.admin_workspaces WHERE user_id = $1', [workspaceId]);
+  const payload = legacy.rows[0]?.payload;
+  await insertSeed(client, payload && typeof payload === 'object' && Object.keys(payload).length ? payload : createInitialState());
+}
+
 async function ensureDb() {
   if (!pool) return;
   const client = await pool.connect();
@@ -580,6 +245,7 @@ async function ensureDb() {
     await client.query('BEGIN');
     await ensureWorkspace(client);
     if (email) await client.query(`INSERT INTO public.admin_roles (admin_id, email, display_name, role) VALUES ($1,$2,$3,'super_admin') ON CONFLICT (admin_id) DO UPDATE SET email=excluded.email, display_name=excluded.display_name, updated_at=now()`, [adminId, email, process.env.ADMIN_NAME || 'ผู้ดูแลระบบ']);
+    await seedIfEmpty(client);
     const current = await snapshotFrom(client);
     await client.query('UPDATE public.admin_workspaces SET payload=$1::jsonb, updated_at=now() WHERE user_id=$2', [JSON.stringify(current.data), workspaceId]);
     await client.query('COMMIT');
@@ -591,255 +257,16 @@ async function ensureDb() {
   }
 }
 
-async function remapReportReferences(client, fromId, toId) {
-  await client.query(`UPDATE public.notifications
-    SET source_id=$1, updated_at=now()
-    WHERE source_type='report' AND source_id=$2`, [toId, fromId]);
-  await client.query(`UPDATE public.admin_actions
-    SET target_id=$1
-    WHERE target_type='report' AND target_id=$2`, [toId, fromId]);
-  await client.query(`UPDATE public.admin_actions
-    SET metadata=jsonb_set(metadata, '{proof_report_id}', to_jsonb($1::text), false)
-    WHERE metadata->>'proof_report_id'=$2`, [toId, fromId]);
-}
-
-async function nextNumericReportId(client) {
-  const result = await client.query(`SELECT COALESCE(MAX(CASE
-      WHEN report_id ~ '^[0-9]+$' THEN report_id::bigint ELSE 0 END), 0) + 1 AS next_id
-    FROM public.reports`);
-  return String(result.rows[0]?.next_id || 1);
-}
-
-async function migrateLegacyCustomerReportIds(client) {
-  const legacy = await client.query(`SELECT report_id
-    FROM public.reports
-    WHERE reporter_type='Customer' AND report_id ~ '^customer:[0-9]+$'
-    ORDER BY created_at, report_id`);
-  for (const row of legacy.rows) {
-    const sourceId = row.report_id.replace(/^customer:/, '');
-    const newReportId = await nextNumericReportId(client);
-    await remapReportReferences(client, row.report_id, newReportId);
-    await client.query(`UPDATE public.reports
-      SET report_id=$1, source_key=$2
-      WHERE report_id=$3`, [newReportId, `app_issue_reports:${sourceId}`, row.report_id]);
-  }
-}
-
-async function syncCustomerReportsFromApp(client) {
-  if (!appPool) return;
-  let result;
-  try {
-    result = await appPool.query(`SELECT r.id, r.sender_type, r.customer_id, r.merchant_id,
-        r.issue_type, r.order_reference, r.details, r.image_url, r.status, r.created_at,
-        r.updated_at, c.name_surname AS customer_name, m.name AS merchant_name
-      FROM public.app_issue_reports r
-      LEFT JOIN public.customer c ON c.customer_id = r.customer_id
-      LEFT JOIN public.merchant m ON m.id = r.merchant_id
-      WHERE upper(coalesce(r.sender_type, 'CUSTOMER')) <> 'MERCHANT'
-      ORDER BY r.id`);
-  } catch (error) {
-    console.warn('ไม่สามารถอ่านรายงานจากลูกค้าจากฐานข้อมูลแอป:', error.message);
-    return;
-  }
-
-  await migrateLegacyCustomerReportIds(client);
-  for (const row of result.rows) {
-    const rawReportId = String(row.id);
-    const sourceKey = `app_issue_reports:${rawReportId}`;
-    const namespacedReportId = `customer:${rawReportId}`;
-    const existing = await client.query(`SELECT report_id
-      FROM public.reports
-      WHERE source_key=$1
-         OR (reporter_type='Customer' AND report_id = ANY($2::text[]))
-      ORDER BY CASE WHEN source_key=$1 THEN 0 ELSE 1 END, report_id
-      LIMIT 1`, [sourceKey, [rawReportId, namespacedReportId]]);
-    const existingReport = existing.rows[0];
-    const reportId = existingReport?.report_id || await nextNumericReportId(client);
-    const isNew = !existingReport;
-    const evidenceUrls = normalizeEvidenceUrls(row.image_url);
-    const reporterId = row.customer_id == null ? null : `customer:${row.customer_id}`;
-    const sourceNote = text(row.details);
-    const reportStatus = sourceReportStatus(row.status);
-    const priority = reportPriority(row.issue_type, sourceNote);
-
-    await client.query(`INSERT INTO public.reports
-        (report_id, source_key, title, reporter_id, reporter_type, reporter_name, shop_name, issue_type,
-         order_id, status, priority, note, evidence_count, evidence_urls, created_at, updated_at)
-      VALUES ($1,$2,$3,$4,'Customer',$5,$6,$3,$7,$8,$9,$10,$11,$12,$13,$14)
-      ON CONFLICT (report_id) DO UPDATE SET
-        source_key=excluded.source_key,
-        title=excluded.title,
-        reporter_id=excluded.reporter_id,
-        reporter_type=excluded.reporter_type,
-        reporter_name=excluded.reporter_name,
-        shop_name=excluded.shop_name,
-        issue_type=excluded.issue_type,
-        order_id=excluded.order_id,
-        priority=excluded.priority,
-        evidence_count=excluded.evidence_count,
-        evidence_urls=excluded.evidence_urls`, [
-      reportId,
-      sourceKey,
-      text(row.issue_type, 'รายงานปัญหา'),
-      reporterId,
-      text(row.customer_name),
-      text(row.merchant_name),
-      text(row.order_reference) || null,
-      reportStatus,
-      priority,
-      sourceNote,
-      evidenceUrls.length,
-      JSON.stringify(evidenceUrls),
-      row.created_at ? safeDate(row.created_at) : new Date(),
-      row.updated_at ? safeDate(row.updated_at) : new Date()
-    ]);
-
-    if (isNew) {
-      await client.query(`INSERT INTO public.notifications
-          (notification_id, source_type, source_id, title, body, priority, delivery_status)
-        SELECT $1,'report',$2,'มีรายงานใหม่',$3,$4,'รอส่ง'
-        WHERE NOT EXISTS (
-          SELECT 1 FROM public.notifications
-          WHERE source_type='report' AND source_id=$2 AND title='มีรายงานใหม่'
-        )
-        ON CONFLICT (notification_id) DO NOTHING`, [
-        `report:${reportId}:created`, reportId, sourceNote || text(row.issue_type, 'มีรายงานใหม่'), priority
-      ]);
-    }
-  }
-}
-
-async function refreshReportPriorities(client) {
-  const result = await client.query('SELECT report_id, title, issue_type, note, priority FROM public.reports');
-  for (const row of result.rows) {
-    const priority = reportPriority(row.issue_type, row.title, row.note);
-    if (row.priority !== priority) {
-      await client.query('UPDATE public.reports SET priority=$1 WHERE report_id=$2', [priority, row.report_id]);
-    }
-  }
-}
-
-async function syncOrdersFromApp(client) {
-  if (!appPool) return;
-  let result;
-  try {
-    result = await appPool.query(`SELECT id::text AS order_id, customer_id::text, merchant_id::text,
-        total_price, status, created_at, updated_at
-      FROM public.orders
-      ORDER BY id`);
-  } catch (error) {
-    console.warn('ไม่สามารถอ่านคำสั่งซื้อจากฐานข้อมูลแอป:', error.message);
-    return;
-  }
-
-  for (const row of result.rows) {
-    await client.query(`INSERT INTO public.app_orders
-        (order_id, customer_id, merchant_id, total_amount, status, created_at, source_updated_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,now())
-      ON CONFLICT (order_id) DO UPDATE SET
-        customer_id=excluded.customer_id,
-        merchant_id=excluded.merchant_id,
-        total_amount=excluded.total_amount,
-        status=excluded.status,
-        created_at=COALESCE(public.app_orders.created_at, excluded.created_at),
-        source_updated_at=excluded.source_updated_at,
-        updated_at=now()`, [
-      text(row.order_id),
-      text(row.customer_id) || null,
-      text(row.merchant_id) || null,
-      row.total_price == null ? null : Number(row.total_price),
-      text(row.status) || null,
-      row.created_at ? safeDate(row.created_at) : null,
-      row.updated_at ? safeDate(row.updated_at) : (row.created_at ? safeDate(row.created_at) : null)
-    ]);
-  }
-}
-
-async function readOrderTrendPeriod(client, days) {
-  const [current, previous] = await Promise.all([
-    client.query(`SELECT d::date AS day, COUNT(o.order_id)::int AS orders
-      FROM generate_series(CURRENT_DATE - ($1::int - 1), CURRENT_DATE, interval '1 day') d
-      LEFT JOIN public.app_orders o ON o.created_at::date = d::date AND o.status = ANY($2::text[])
-      GROUP BY d::date
-      ORDER BY d::date`, [days, completedOrderStatuses]),
-    client.query(`SELECT d::date AS day, COUNT(o.order_id)::int AS orders
-      FROM generate_series(CURRENT_DATE - ($1::int * 2 - 1), CURRENT_DATE - $1::int, interval '1 day') d
-      LEFT JOIN public.app_orders o ON o.created_at::date = d::date AND o.status = ANY($2::text[])
-      GROUP BY d::date
-      ORDER BY d::date`, [days, completedOrderStatuses])
-  ]);
-  const mapDays = rows => rows.map(row => ({date: String(row.day).slice(0, 10), orders: Number(row.orders || 0)}));
-  const daysNow = mapDays(current.rows);
-  const previousDays = mapDays(previous.rows);
-  return {
-    days: daysNow,
-    previousDays,
-    total: daysNow.reduce((sum, day) => sum + day.orders, 0),
-    previousTotal: previousDays.reduce((sum, day) => sum + day.orders, 0)
-  };
-}
-
-async function orderTrendData(client) {
-  const [seven, thirty] = await Promise.all([
-    readOrderTrendPeriod(client, 7),
-    readOrderTrendPeriod(client, 30)
-  ]);
-  return {7: seven, 30: thirty};
-}
-
 async function snapshotFrom(client) {
-  await syncCustomerReportsFromApp(client);
-  await refreshReportPriorities(client);
-  await syncOrdersFromApp(client);
-  const [users, reports, notifications, history, reportReviews, refundReviews, workspace] = await Promise.all([
-    client.query(`SELECT u.*, latest.metadata->>'suspension_until' AS suspension_until,
-        latest.metadata->>'suspension_reason_type' AS suspension_reason_type
-      FROM public.app_users u
-      LEFT JOIN LATERAL (
-        SELECT a.action_type, a.metadata
-        FROM public.admin_actions a
-        WHERE a.target_type='user' AND a.target_id=u.user_id
-        ORDER BY a.created_at DESC, a.action_id DESC
-        LIMIT 1
-      ) latest ON latest.action_type='ระงับบัญชี' AND u.status='ระงับบัญชี'
-      ORDER BY u.created_at, u.user_id`),
+  const [users, reports, notifications, history, workspace] = await Promise.all([
+    client.query('SELECT * FROM public.app_users ORDER BY created_at, user_id'),
     client.query('SELECT * FROM public.reports ORDER BY created_at DESC, report_id'),
-    client.query(`SELECT n.*, r.reporter_type, r.reporter_name, r.shop_name, r.created_at AS report_created_at
-      FROM public.notifications n
-      INNER JOIN public.reports r
-        ON r.report_id = n.source_id
-      WHERE n.source_type = 'report'
-      ORDER BY n.created_at DESC, n.notification_id`),
-    client.query('SELECT action_id, action_type, target_type, target_id, reason, created_at FROM public.admin_actions ORDER BY created_at DESC LIMIT 200'),
-    client.query(`SELECT target_id, reason FROM public.admin_actions
-      WHERE target_type='report' AND action_type LIKE 'อัปเดต Report%' AND reason IS NOT NULL
-      ORDER BY created_at DESC, action_id DESC`),
-    client.query(`SELECT target_id, reason, metadata, created_at FROM public.admin_actions
-      WHERE target_type='report' AND action_type='ติดตามการคืนเงิน'
-      ORDER BY created_at DESC, action_id DESC`),
+    client.query('SELECT * FROM public.notifications ORDER BY created_at DESC, notification_id'),
+    client.query('SELECT action_id, action_type, target_id, created_at FROM public.admin_actions ORDER BY created_at DESC LIMIT 200'),
     client.query('SELECT revision FROM public.admin_workspaces WHERE user_id = $1', [workspaceId])
   ]);
-  const orderTrends = await orderTrendData(client);
-  const sourceReports = await sourceReportData(reports.rows);
-  const reviewNotes = new Map();
-  for (const row of reportReviews.rows) {
-    if (text(row.reason) && !reviewNotes.has(String(row.target_id))) {
-      reviewNotes.set(String(row.target_id), text(row.reason));
-    }
-  }
-  const refundTracking = new Map();
-  for (const row of refundReviews.rows) {
-    if (!refundTracking.has(String(row.target_id))) {
-      refundTracking.set(String(row.target_id), {
-        ...(row.metadata && typeof row.metadata === 'object' ? row.metadata : {}),
-        status: text(row.metadata?.refund_status, 'รอติดต่อร้านค้า'),
-        updatedAt: row.created_at,
-        note: text(row.reason)
-      });
-    }
-  }
   return {
-    data: {users: users.rows.map(mapUser), reports: reports.rows.map((row) => mapReport(row, sourceReports.get(String(row.report_id)) || {}, reviewNotes.get(String(row.report_id)) || '', refundTracking.get(String(row.report_id)) || null)), notifications: notifications.rows.map(mapNotification), history: history.rows.map(mapHistory), transactions: [], orderTrends},
+    data: {users: users.rows.map(mapUser), reports: reports.rows.map(mapReport), notifications: notifications.rows.map(mapNotification), history: history.rows.map(mapHistory), transactions: []},
     revision: Number(workspace.rows[0]?.revision || 0)
   };
 }
@@ -864,105 +291,32 @@ async function writeRelationalAction(action, revision, admin) {
     if (action?.type === 'report.update') {
       if (!can(admin, 'reports')) throw Object.assign(new Error('ไม่มีสิทธิ์แก้ไขรายงาน'), {code: 'FORBIDDEN'});
       if (!['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(action.status) || !validText(action.note, 5, 2000)) throw new Error('ข้อมูลรายงานไม่ถูกต้อง');
-      const existing = await client.query(`SELECT status, reporter_type, source_key FROM public.reports WHERE report_id=$1 FOR UPDATE`, [action.id]);
-      if (!existing.rows.length) throw new Error('ไม่พบรายงาน');
-      const result = await client.query(`UPDATE public.reports SET status=$1, updated_at=now() WHERE report_id=$2 RETURNING reporter_id, reporter_type, priority, source_key`, [action.status, action.id]);
+      const reportRanks = {'รอตรวจสอบ': 0, 'กำลังตรวจสอบ': 1, 'ดำเนินการแล้ว': 2, 'ปิดเรื่อง': 3};
+      const currentReport = await client.query('SELECT status FROM public.reports WHERE report_id = $1', [action.id]);
+      if (!currentReport.rows.length) throw new Error('ไม่พบรายงาน');
+      const prevStatus = currentReport.rows[0].status;
+      if ((reportRanks[action.status] ?? 0) < (reportRanks[prevStatus] ?? 0)) {
+        throw new Error('ไม่สามารถย้อนกลับไปสถานะก่อนหน้าได้');
+      }
+      if (prevStatus === 'ปิดเรื่อง') {
+        throw new Error('รายงานปิดเรื่องเรียบร้อยแล้ว ไม่สามารถแก้ไขได้');
+      }
+      if (prevStatus === 'ดำเนินการแล้ว' && action.status === 'ดำเนินการแล้ว') {
+        throw new Error('รายงานดำเนินการแล้ว กรุณาปรับเป็นสถานะปิดเรื่องเพื่อบันทึก');
+      }
+      const result = await client.query(`UPDATE public.reports SET status=$1, note=$2, updated_at=now() WHERE report_id=$3 RETURNING reporter_id, priority`, [action.status, action.note.trim(), action.id]);
       if (!result.rows.length) throw new Error('ไม่พบรายงาน');
-      if (action.notify === true) await syncReportStatusToApp({reportId: action.id, sourceKey: result.rows[0].source_key || existing.rows[0].source_key, reporterType: result.rows[0].reporter_type || existing.rows[0].reporter_type, status: action.status, note: action.note, previousStatus: existing.rows[0].status});
       if (action.notify === true) await client.query(`INSERT INTO public.notifications (notification_id, recipient_id, source_type, source_id, title, body, priority, delivery_status) VALUES ($1,$2,'report',$3,$4,$5,$6,'รอส่ง')`, [crypto.randomUUID(), result.rows[0].reporter_id || null, action.id, `รายงาน #${action.id} อัปเดตแล้ว`, action.note.trim(), result.rows[0].priority || 'ปกติ']);
       await recordAction(client, admin, `อัปเดต Report เป็น ${action.status}`, 'report', action.id, action.note);
     } else if (action?.type === 'user.status') {
       if (!can(admin, 'users')) throw Object.assign(new Error('ไม่มีสิทธิ์จัดการบัญชีผู้ใช้'), {code: 'FORBIDDEN'});
       if (!['ระงับบัญชี', 'ใช้งานปกติ'].includes(action.status) || !validText(action.reason, 5, 1000)) throw new Error('ข้อมูลสถานะบัญชีไม่ถูกต้อง');
-      const user = await client.query(`SELECT user_id, role FROM public.app_users WHERE user_id=$1 FOR UPDATE`, [action.id]);
-      if (!user.rows.length) throw new Error('ไม่พบบัญชี');
-      const suspensionPlan = action.status === 'ระงับบัญชี'
-        ? buildSuspensionPlan(action, user.rows[0])
-        : {reasonType: 'lift_suspension', durationDays: null, until: null, effectiveReason: action.reason.trim()};
-      const eventId = crypto.randomUUID();
-      await syncAccountStatus({...action, role: user.rows[0].role, reason: suspensionPlan.effectiveReason}, admin, eventId);
-      const result = await client.query(`UPDATE public.app_users SET status=$1, status_reason=$2, status_changed_by=$3, status_changed_at=now(), updated_at=now() WHERE user_id=$4 RETURNING user_id`, [action.status, suspensionPlan.effectiveReason, adminId, action.id]);
+      const result = await client.query(`UPDATE public.app_users SET status=$1, status_reason=$2, status_changed_by=$3, status_changed_at=now(), updated_at=now() WHERE user_id=$4 RETURNING user_id`, [action.status, action.reason.trim(), adminId, action.id]);
       if (!result.rows.length) throw new Error('ไม่พบบัญชี');
-      await recordAction(client, admin, action.status, 'user', action.id, suspensionPlan.effectiveReason, {
-        event_id: eventId,
-        backend_synced: true,
-        suspension_reason_type: suspensionPlan.reasonType,
-        ...(suspensionPlan.until ? {suspension_until: suspensionPlan.until, suspension_duration_days: suspensionPlan.durationDays} : {})
-      });
+      await recordAction(client, admin, action.status, 'user', action.id, action.reason.trim());
     } else if (action?.type === 'notification.read') {
-      if (action.id) {
-        await client.query(`UPDATE public.notifications SET is_read=true, read_at=COALESCE(read_at, now()), updated_at=now()
-          WHERE notification_id=$1 AND is_read=false`, [String(action.id)]);
-        await recordAction(client, admin, 'อ่านการแจ้งเตือน', 'notification', String(action.id), 'ผู้ดูแลเปิดดูการแจ้งเตือน');
-      } else {
-        await client.query(`UPDATE public.notifications SET is_read=true, read_at=COALESCE(read_at, now()), updated_at=now() WHERE is_read=false`);
-        await recordAction(client, admin, 'อ่านการแจ้งเตือนทั้งหมด', 'notification', 'all', 'ผู้ดูแลอ่านการแจ้งเตือน');
-      }
-    } else if (action?.type === 'refund.track') {
-      if (!can(admin, 'reports')) throw Object.assign(new Error('ไม่มีสิทธิ์ติดตามการคืนเงิน'), {code: 'FORBIDDEN'});
-      if (!refundTrackingStatuses.includes(action.status)) throw new Error('สถานะการติดตามคืนเงินไม่ถูกต้อง');
-      const report = await client.query(`SELECT report_id, source_key, reporter_type, order_id, reporter_id
-        FROM public.reports WHERE report_id=$1 FOR UPDATE`, [action.id]);
-      if (!report.rows.length) throw new Error('ไม่พบรายงานลูกค้า');
-      const sourceReport = report.rows[0];
-      if (sourceReport.reporter_type !== 'Customer' || !text(sourceReport.order_id)) {
-        throw new Error('ติดตามคืนเงินได้เฉพาะรายงานจากลูกค้าที่มีเลขออเดอร์');
-      }
-      const previousResult = await client.query(`SELECT metadata FROM public.admin_actions
-        WHERE target_type='report' AND target_id=$1 AND action_type='ติดตามการคืนเงิน'
-        ORDER BY created_at DESC, action_id DESC LIMIT 1`, [action.id]);
-      const previous = previousResult.rows[0]?.metadata && typeof previousResult.rows[0].metadata === 'object'
-        ? previousResult.rows[0].metadata : {};
-      const contactedAt = text(action.contactedAt, text(previous.contacted_at));
-      const contactNote = text(action.contactNote, text(previous.contact_note));
-      const proofReportId = text(action.proofReportId, text(previous.proof_report_id));
-      const verificationNote = text(action.verificationNote, text(previous.verification_note));
-      let deadlineAt = text(previous.deadline_at);
-      if (contactedAt) {
-        const contactDate = new Date(contactedAt);
-        if (Number.isNaN(contactDate.getTime())) throw new Error('วันเวลาการโทรไม่ถูกต้อง');
-        if (contactDate.getTime() > Date.now() + 60 * 1000) throw new Error('วันเวลาการโทรต้องไม่เกินเวลาปัจจุบัน');
-        deadlineAt = new Date(contactDate.getTime() + refundDeadlineDays * 24 * 60 * 60 * 1000).toISOString();
-      }
-      if (action.status === 'แจ้งร้านค้าแล้ว' && (!contactedAt || !validText(contactNote, 5, 1000))) {
-        throw new Error('กรุณาบันทึกวันเวลาและรายละเอียดการโทรเตือนร้านค้า');
-      }
-      if (['รอหลักฐานการคืนเงิน', 'ส่งหลักฐานแล้ว', 'ยืนยันคืนเงินแล้ว'].includes(action.status) && !deadlineAt) {
-        throw new Error('ยังไม่มีวันครบกำหนดจากการโทรเตือนร้านค้า');
-      }
-      if (['ส่งหลักฐานแล้ว', 'ยืนยันคืนเงินแล้ว'].includes(action.status)) {
-        if (!/^\d+$/.test(proofReportId)) throw new Error('กรุณาเลือกรายงานหลักฐานการคืนเงินจากร้านค้า');
-        const proof = await client.query(`SELECT report_id, evidence_count, evidence_urls, reporter_type, order_id
-          FROM public.reports WHERE report_id=$1 LIMIT 1`, [proofReportId]);
-        if (!proof.rows.length || proof.rows[0].reporter_type !== 'Shop' || String(proof.rows[0].order_id || '') !== String(sourceReport.order_id) || !hasReportEvidence(proof.rows[0])) {
-          throw new Error('หลักฐานต้องมาจากร้านค้า เป็นรายงานของออเดอร์เดียวกัน และมีรูปหลักฐาน');
-        }
-      }
-      if (action.status === 'ยืนยันคืนเงินแล้ว' && !validText(verificationNote, 5, 1000)) {
-        throw new Error('กรุณาบันทึกผลตรวจสอบหลักฐานจากร้านค้า');
-      }
-      if (action.status === 'เกินกำหนด') {
-        if (!deadlineAt || new Date(deadlineAt).getTime() > Date.now()) throw new Error('ยังไม่ถึงกำหนด 2 วันสำหรับการคืนเงิน');
-      }
-      const metadata = {
-        refund_status: action.status,
-        contacted_at: contactedAt || null,
-        deadline_at: deadlineAt || null,
-        contact_note: contactNote || null,
-        proof_report_id: proofReportId || null,
-        verification_note: verificationNote || null,
-        verified_at: action.status === 'ยืนยันคืนเงินแล้ว' ? now() : (previous.verified_at || null),
-        deadline_days: refundDeadlineDays
-      };
-      const actionNote = action.status === 'ยืนยันคืนเงินแล้ว'
-        ? `ตรวจหลักฐานร้านค้าแล้ว: ${verificationNote}`
-        : action.status === 'แจ้งร้านค้าแล้ว'
-          ? `โทรเตือนร้านค้าแล้ว ครบกำหนดคืนเงิน ${displayDateTime(deadlineAt)}`
-          : action.status === 'เกินกำหนด' ? 'รายงานร้านค้าไม่คืนเงิน: เกินกำหนด 2 วัน' : `ติดตามคืนเงิน: ${action.status}`;
-      if (['ยืนยันคืนเงินแล้ว', 'เกินกำหนด'].includes(action.status)) {
-        await syncReportStatusToApp({reportId: action.id, sourceKey: sourceReport.source_key, reporterType: 'Customer', status: action.status, note: actionNote, previousStatus: ''});
-      }
-      await recordAction(client, admin, 'ติดตามการคืนเงิน', 'report', action.id, actionNote, metadata);
+      await client.query(`UPDATE public.notifications SET is_read=true, read_at=COALESCE(read_at, now()), updated_at=now() WHERE is_read=false`);
+      await recordAction(client, admin, 'อ่านการแจ้งเตือนทั้งหมด', 'notification', 'all', 'ผู้ดูแลอ่านการแจ้งเตือน');
     } else if (String(action?.type || '').startsWith('refund') || String(action?.type || '').startsWith('payment')) {
       throw new Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
     } else {
@@ -980,66 +334,11 @@ async function writeRelationalAction(action, revision, admin) {
   } finally { client.release(); }
 }
 
-async function releaseExpiredSuspensions() {
-  if (!pool || !foodCartBackendUrl || !foodCartAdminSecret) return;
-  const client = await pool.connect();
-  try {
-    const result = await client.query(`
-      SELECT u.user_id, u.role, latest.metadata->>'suspension_until' AS suspension_until
-      FROM public.app_users u
-      JOIN LATERAL (
-        SELECT a.action_type, a.metadata
-        FROM public.admin_actions a
-        WHERE a.target_type='user' AND a.target_id=u.user_id
-        ORDER BY a.created_at DESC, a.action_id DESC
-        LIMIT 1
-      ) latest ON true
-      WHERE u.status='ระงับบัญชี'
-        AND latest.action_type='ระงับบัญชี'
-        AND (latest.metadata->>'suspension_until') IS NOT NULL
-        AND (latest.metadata->>'suspension_until')::timestamptz <= now()
-    `);
-
-    for (const row of result.rows) {
-      const eventId = crypto.randomUUID();
-      const reason = `ครบกำหนดการระงับบัญชีชั่วคราว (${displayDateTime(row.suspension_until)})`;
-      try {
-        await syncAccountStatus({
-          id: row.user_id,
-          role: row.role,
-          status: 'ใช้งานปกติ',
-          reason
-        }, {name: 'ระบบ Admin'}, eventId);
-        await client.query('BEGIN');
-        const updated = await client.query(`UPDATE public.app_users
-          SET status='ใช้งานปกติ', status_reason=$1, status_changed_by=$2,
-              status_changed_at=now(), updated_at=now()
-          WHERE user_id=$3 AND status='ระงับบัญชี'
-          RETURNING user_id`, [reason, adminId, row.user_id]);
-        if (updated.rows.length) {
-          await recordAction(client, {id: adminId}, 'ใช้งานปกติ', 'user', row.user_id, reason, {
-            event_id: eventId,
-            backend_synced: true,
-            automatic_expiry: true
-          });
-          await client.query(`UPDATE public.admin_workspaces SET revision=revision+1 WHERE user_id=$1`, [workspaceId]);
-        }
-        await client.query('COMMIT');
-      } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
-        console.error(`Automatic suspension expiry failed for ${row.user_id}:`, error.message);
-      }
-    }
-  } finally {
-    client.release();
-  }
-}
-
 async function handleIntegrationEvent(event) {
   const eventId = text(event?.event_id || event?.eventId);
   const eventType = text(event?.event_type || event?.eventType);
   const data = event?.data && typeof event.data === 'object' ? event.data : {};
-  const supported = new Set(['user.upsert', 'user.delete', 'order.upsert', 'report.created', 'report.updated', 'notification.created']);
+  const supported = new Set(['user.upsert', 'order.upsert', 'report.created', 'report.updated', 'notification.created']);
   if (!eventId || !supported.has(eventType)) throw new Error('event ไม่รองรับหรือไม่มี event_id');
   const client = await pool.connect();
   try {
@@ -1048,15 +347,11 @@ async function handleIntegrationEvent(event) {
     if (!inserted.rows.length) { await client.query('COMMIT'); return {duplicate: true}; }
     if (eventType === 'user.upsert') {
       await client.query(`INSERT INTO public.app_users (user_id, display_name, email, role, status, shop_name, phone, category, line_id, facebook_url, latitude, longitude, source_updated_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now()) ON CONFLICT (user_id) DO UPDATE SET display_name=excluded.display_name,email=excluded.email,role=excluded.role,shop_name=excluded.shop_name,phone=excluded.phone,category=excluded.category,line_id=excluded.line_id,facebook_url=excluded.facebook_url,latitude=excluded.latitude,longitude=excluded.longitude,source_updated_at=excluded.source_updated_at,updated_at=now()`, [text(data.user_id || data.id), text(data.display_name || data.name, 'ไม่ระบุชื่อ'), text(data.email) || null, data.role === 'Shop' ? 'Shop' : 'Customer', data.status === 'ระงับบัญชี' ? 'ระงับบัญชี' : 'ใช้งานปกติ', text(data.shop_name || data.shop), text(data.phone) || null, text(data.category) || null, text(data.line_id || data.lineId) || null, text(data.facebook_url || data.facebook) || null, data.latitude == null ? null : Number(data.latitude), data.longitude == null ? null : Number(data.longitude), data.source_updated_at ? safeDate(data.source_updated_at) : null]);
-    } else if (eventType === 'user.delete') {
-      await client.query('DELETE FROM public.app_users WHERE user_id=$1', [text(data.user_id || data.id)]);
     } else if (eventType === 'order.upsert') {
       await client.query(`INSERT INTO public.app_orders (order_id, customer_id, merchant_id, total_amount, status, created_at, source_updated_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT (order_id) DO UPDATE SET customer_id=excluded.customer_id,merchant_id=excluded.merchant_id,total_amount=excluded.total_amount,status=excluded.status,source_updated_at=excluded.source_updated_at,updated_at=now()`, [text(data.order_id || data.id), text(data.customer_id) || null, text(data.merchant_id) || null, data.total_amount == null ? null : Number(data.total_amount), text(data.status) || null, data.created_at ? safeDate(data.created_at) : null, data.source_updated_at ? safeDate(data.source_updated_at) : null]);
     } else if (eventType === 'report.created' || eventType === 'report.updated') {
-      const evidenceUrls = normalizeEvidenceUrls(data.evidence_urls || data.evidenceUrls);
-      const reportId = normalizeAdminReportId(data);
-      await client.query(`INSERT INTO public.reports (report_id,title,reporter_id,reporter_type,reporter_name,shop_name,issue_type,order_id,status,priority,note,evidence_count,evidence_urls,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,now()) ON CONFLICT (report_id) DO UPDATE SET title=excluded.title,reporter_id=excluded.reporter_id,reporter_type=excluded.reporter_type,reporter_name=excluded.reporter_name,shop_name=excluded.shop_name,issue_type=excluded.issue_type,order_id=excluded.order_id,status=excluded.status,priority=excluded.priority,note=excluded.note,evidence_count=excluded.evidence_count,evidence_urls=excluded.evidence_urls,updated_at=now()`, [reportId, text(data.title || data.name, 'รายงานปัญหา'), text(data.reporter_id || data.user_id) || null, data.reporter_type === 'Shop' ? 'Shop' : 'Customer', text(data.reporter_name || data.person) || null, text(data.shop_name || data.shop) || null, text(data.issue_type || data.type, 'Other'), text(data.order_id || data.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(data.status) ? data.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ', text(data.note), Number(data.evidence_count || data.evidenceCount || evidenceUrls.length), JSON.stringify(evidenceUrls), data.created_at ? safeDate(data.created_at) : new Date()]);
-      if (eventType === 'report.created') await client.query(`INSERT INTO public.notifications (notification_id, source_type, source_id, title, body, priority, delivery_status) VALUES ($1,'report',$2,$3,$4,$5,'รอส่ง')`, [crypto.randomUUID(), reportId, 'มีรายงานใหม่', text(data.title || data.name, 'มีรายงานใหม่'), ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ']);
+      await client.query(`INSERT INTO public.reports (report_id,title,reporter_id,reporter_type,reporter_name,shop_name,issue_type,order_id,status,priority,note,evidence_count,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now()) ON CONFLICT (report_id) DO UPDATE SET title=excluded.title,reporter_id=excluded.reporter_id,reporter_type=excluded.reporter_type,reporter_name=excluded.reporter_name,shop_name=excluded.shop_name,issue_type=excluded.issue_type,order_id=excluded.order_id,status=excluded.status,priority=excluded.priority,note=excluded.note,evidence_count=excluded.evidence_count,updated_at=now()`, [text(data.report_id || data.id), text(data.title || data.name, 'รายงานปัญหา'), text(data.reporter_id || data.user_id) || null, data.reporter_type === 'Shop' ? 'Shop' : 'Customer', text(data.reporter_name || data.person) || null, text(data.shop_name || data.shop) || null, text(data.issue_type || data.type, 'Other'), text(data.order_id || data.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(data.status) ? data.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ', text(data.note), Number(data.evidence_count || data.evidenceCount || 0), data.created_at ? safeDate(data.created_at) : new Date()]);
+      if (eventType === 'report.created') await client.query(`INSERT INTO public.notifications (notification_id, source_type, source_id, title, body, priority, delivery_status) VALUES ($1,'report',$2,$3,$4,$5,'รอส่ง')`, [crypto.randomUUID(), text(data.report_id || data.id), 'มีรายงานใหม่', text(data.title || data.name, 'มีรายงานใหม่'), ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ']);
     } else if (eventType === 'notification.created') {
       await client.query(`INSERT INTO public.notifications (notification_id,recipient_id,source_type,source_id,title,body,priority,delivery_status,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (notification_id) DO NOTHING`, [text(data.notification_id || data.id, crypto.randomUUID()), text(data.recipient_id) || null, text(data.source_type) || null, text(data.source_id) || null, text(data.title, 'การแจ้งเตือน'), text(data.body), ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ', text(data.delivery_status, 'รอส่ง'), data.created_at ? safeDate(data.created_at) : new Date()]);
     }
@@ -1104,11 +399,7 @@ app.post('/api/integration/supabase-webhook', requireWebhook, async (req, res) =
 });
 
 app.get('/api/admin', requireAdmin, async (_req, res) => {
-  try {
-    await releaseExpiredSuspensions();
-    const workspace = await readWorkspace();
-    return json(res, {data: workspace.data || workspace.payload, revision: workspace.revision, account: {name: process.env.ADMIN_NAME || 'ผู้ดูแลระบบ', email}});
-  }
+  try { const workspace = await readWorkspace(); return json(res, {data: workspace.data || workspace.payload, revision: workspace.revision, account: {name: process.env.ADMIN_NAME || 'ผู้ดูแลระบบ', email}}); }
   catch (error) { console.error(error); return json(res, {error: 'ไม่สามารถโหลดข้อมูลได้'}, 503); }
 });
 
@@ -1121,8 +412,7 @@ app.post('/api/admin', requireAdmin, async (req, res) => {
       return json(res, saved);
     }
     if (memory.revision !== revision) return json(res, {error: 'ข้อมูลเปลี่ยนแปลง กรุณาโหลดใหม่'}, 409);
-    const actionType = String(req.body.action.type || '');
-    if ((actionType.startsWith('refund') && actionType !== 'refund.track') || actionType.startsWith('payment')) throw new Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
+    if (String(req.body.action.type || '').startsWith('refund') || String(req.body.action.type || '').startsWith('payment')) throw new Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
     memory = {payload: normalizeSnapshot(applyAction(memory.payload, req.body.action)), revision: revision + 1};
     return json(res, {data: memory.payload, revision: memory.revision});
   } catch (error) {
@@ -1133,8 +423,6 @@ app.post('/api/admin', requireAdmin, async (req, res) => {
 });
 
 app.get('*', (_req, res) => res.sendFile('admin.html', {root: 'public'}));
-const suspensionExpiryTimer = setInterval(() => releaseExpiredSuspensions().catch((error) => console.error('Suspension expiry check failed:', error.message)), 60 * 1000);
-suspensionExpiryTimer.unref?.();
 ensureDb().then(() => app.listen(port, () => console.log(`Foot cart Admin listening on ${port}`))).catch((error) => {
   console.error('Database initialization failed:', error.message);
   app.listen(port, () => console.log(`Foot cart Admin listening on ${port} without database`));
