@@ -33,8 +33,13 @@ export function applyAction(input,action){
  if(action.type==='report.update'){
   const r=next.reports.find(r=>r.id===action.id);if(!r)throw Error('ไม่พบรายงาน');
   if(!['รอตรวจสอบ','กำลังตรวจสอบ','ดำเนินการแล้ว','ปิดเรื่อง'].includes(action.status))throw Error('สถานะ Report ไม่ถูกต้อง');
+  const reportRanks={'รอตรวจสอบ':0,'กำลังตรวจสอบ':1,'ดำเนินการแล้ว':2,'ปิดเรื่อง':3};
+  if((reportRanks[action.status]??0)<(reportRanks[r.status]??0))throw Error('ไม่สามารถย้อนกลับไปสถานะก่อนหน้าได้');
+  if(r.status==='ปิดเรื่อง')throw Error('รายงานปิดเรื่องเรียบร้อยแล้ว ไม่สามารถแก้ไขได้');
+  if(r.status==='ดำเนินการแล้ว'&&action.status==='ดำเนินการแล้ว')throw Error('รายงานดำเนินการแล้ว กรุณาปรับเป็นสถานะปิดเรื่องเพื่อบันทึก');
   if(!validText(action.note,5,2000))throw Error('กรุณาระบุผลการตรวจสอบอย่างน้อย 5 ตัวอักษร');
-  r.status=action.status;r.note=action.note.trim();r.reviewNote=action.note.trim();r.updatedAt=now;
+  if(!r.originalDetails&&r.note&&r.status==='รอตรวจสอบ')r.originalDetails=r.note;
+  r.status=action.status;r.note=action.note.trim();r.reviewNote=action.note.trim();r.admin_note=action.note.trim();r.updatedAt=now;
   if(action.notify===true)next.notifications.unshift({id:crypto.randomUUID(),title:'เตรียมแจ้งผล Report #'+r.id,body:r.note,time:now,priority:r.priority||'ปกติ',read:false,recipient:r.person,delivery:'รอเชื่อมต่อ Mobile App'});
   audit='อัปเดต Report เป็น '+r.status;target=r.id;
  }else if(action.type==='user.status'){

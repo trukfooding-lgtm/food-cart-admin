@@ -101,11 +101,22 @@ function openReport(id){
  const explicitUrls=(Array.isArray(r.evidenceUrls)?r.evidenceUrls:(r.image_url?[r.image_url]:[])).map(normalizeEvidenceUrl).filter(Boolean);
  const evidenceUrls=[...new Set([...explicitUrls,...extractEvidenceUrls(r.note,r.name,r.details,r.user_note)])];
  const evidenceMarkup=evidenceUrls.length?evidenceUrls.map((url,i)=>`<button type="button" class="evidence-thumb" data-evidence="${escape(url)}" aria-label="เปิดดูรูปหลักฐาน ${i+1}"><img src="${escape(url)}" alt="หลักฐาน ${i+1}" style="max-width:100%;max-height:100%;object-fit:contain;border-radius:6px" onerror="this.hidden=true;this.nextElementSibling.textContent='เปิดลิงก์หลักฐานไม่สำเร็จ'"><small>หลักฐาน ${i+1}</small></button>`).join(''):r.evidenceCount?`<div class="read-only-box"><strong>หลักฐาน ${r.evidenceCount} รูป</strong><p>มีหลักฐานแนบมา แต่ไม่พบ URL รูปภาพที่แสดงได้โดยตรง</p></div>`:'<div class="read-only-box"><strong>ไม่มีรูปหลักฐาน</strong></div>';
- const isAlreadyResolved=['ดำเนินการแล้ว','ปิดเรื่อง'].includes(r.status);
- const reporterText=r.originalDetails||r.user_note||r.details||r.description||reportDetailText(r);
+ 
+ const reportProgression=['รอตรวจสอบ','กำลังตรวจสอบ','ดำเนินการแล้ว','ปิดเรื่อง'];
+ const reportRanks={'รอตรวจสอบ':0,'กำลังตรวจสอบ':1,'ดำเนินการแล้ว':2,'ปิดเรื่อง':3};
+ const currentRank=reportRanks[r.status]??0;
+ const allowedStatuses=reportProgression.filter(s=>(reportRanks[s]??0)>=currentRank);
+ 
+ const isClosed=r.status==='ปิดเรื่อง';
+ const isCompleted=r.status==='ดำเนินการแล้ว';
+ const userDetailContent=r.originalDetails||r.user_note||r.details||r.description;
+ const reporterText=userDetailContent?compactText(userDetailContent,300):(r.name?`ผู้ใช้แจ้งว่า “${r.name}”`:'ไม่มีรายละเอียดเพิ่มเติมจากผู้รายงาน');
  const adminReviewText=r.reviewNote||r.admin_note||(r.status!=='รอตรวจสอบ'?r.note:'')||'';
 
- openDialog('รายงาน #'+r.id,'รายละเอียดรายงาน',details([['วันที่และเวลาแจ้ง',r.reportedAt||'ไม่พบวันที่รายงาน'],['ผู้รายงาน',escape(reporterName(r,u))],['รหัสผู้ใช้',r.userId],['ประเภทบัญชี',reporterLabel(r.reporterType)],['ประเภทปัญหา',reportTypeLabel(r.type)],...(r.orderId?[['รหัสคำสั่งซื้อ',r.orderId]]:[]),['ความสำคัญ',r.priority],['สถานะรายงาน',badge(r.status)],['หลักฐาน',r.evidenceCount+' รูป']])+`<p class="detail-description"><strong>รายละเอียดจากผู้รายงาน</strong><br>${escape(reporterText)}</p><p class="detail-description" style="margin-top:12px"><strong>ผลตรวจสอบของแอดมิน</strong><br>${escape(adminReviewText||'ยังไม่มีผลตรวจสอบ')}</p><div class="evidence-strip">${evidenceMarkup}</div>${r.orderId?`<div class="read-only-box"><strong>ข้อมูลคำสั่งซื้อที่เกี่ยวข้อง</strong><p>${r.orderId}</p></div>`:''}${related.length?`<div class="related-list"><strong>รายงานที่เกี่ยวข้อง</strong>${related.map(x=>`<button class="text-link" data-report="${x.id}">#${x.id} · ${escape(x.name)}${icon('chevron-right')}</button>`).join('')}</div>`:''}<form id="report-form"><label class="field"><span>สถานะรายงาน</span><select name="status" id="report-status-select">${['รอตรวจสอบ','กำลังตรวจสอบ','ดำเนินการแล้ว','ปิดเรื่อง'].map(s=>`<option value="${s}" ${r.status===s?'selected':''}>${s}</option>`).join('')}</select></label><label class="field"><span>ผลการตรวจสอบ (บันทึกแจ้งผล)</span><textarea name="note" id="report-note-input" required minlength="5" maxlength="2000" placeholder="บันทึกผลการตรวจสอบ">${escape(adminReviewText||r.note||'')}</textarea></label><div class="auto-notify">${icon('bell')}<span>ระบบจะส่งแจ้งผลไปยังผู้ใช้อัตโนมัติ</span></div><p class="error-text" id="form-error" role="alert"></p><div class="dialog-actions">${u?`<button type="button" class="btn" data-user="${u.id}">${icon('user-round')}ดูบัญชีผู้รายงาน</button>`:''}<button type="submit" id="report-submit-btn" class="btn primary" ${isAlreadyResolved?'disabled':''}>${icon('check')}${isAlreadyResolved?'ดำเนินการแล้ว (เลือกสถานะอื่นเพื่อเปลี่ยน)':'บันทึกผลรายงาน'}</button></div></form>`);
+ const submitBtnText=isClosed?'ปิดเรื่องเรียบร้อยแล้ว':(isCompleted?'ดำเนินการแล้ว (เลือกปิดเรื่องเพื่อบันทึก)':'บันทึกผลรายงาน');
+ const submitBtnDisabled=isClosed||isCompleted;
+
+ openDialog('รายงาน #'+r.id,'รายละเอียดรายงาน',details([['วันที่และเวลาแจ้ง',r.reportedAt||'ไม่พบวันที่รายงาน'],['ผู้รายงาน',escape(reporterName(r,u))],['รหัสผู้ใช้',r.userId],['ประเภทบัญชี',reporterLabel(r.reporterType)],['ประเภทปัญหา',reportTypeLabel(r.type)],...(r.orderId?[['รหัสคำสั่งซื้อ',r.orderId]]:[]),['ความสำคัญ',r.priority],['สถานะรายงาน',badge(r.status)],['หลักฐาน',r.evidenceCount+' รูป']])+`<p class="detail-description"><strong>รายละเอียดจากผู้รายงาน</strong><br>${escape(reporterText)}</p><p class="detail-description" style="margin-top:12px"><strong>ผลตรวจสอบของแอดมิน</strong><br>${escape(adminReviewText||'ยังไม่มีผลตรวจสอบ')}</p><div class="evidence-strip">${evidenceMarkup}</div>${r.orderId?`<div class="read-only-box"><strong>ข้อมูลคำสั่งซื้อที่เกี่ยวข้อง</strong><p>${r.orderId}</p></div>`:''}${related.length?`<div class="related-list"><strong>รายงานที่เกี่ยวข้อง</strong>${related.map(x=>`<button class="text-link" data-report="${x.id}">#${x.id} · ${escape(x.name)}${icon('chevron-right')}</button>`).join('')}</div>`:''}<form id="report-form"><label class="field"><span>สถานะรายงาน</span><select name="status" id="report-status-select" ${isClosed?'disabled':''}>${allowedStatuses.map(s=>`<option value="${s}" ${r.status===s?'selected':''}>${s}</option>`).join('')}</select></label><label class="field"><span>ผลการตรวจสอบ (บันทึกแจ้งผล)</span><textarea name="note" id="report-note-input" required minlength="5" maxlength="2000" placeholder="บันทึกผลการตรวจสอบ" ${isClosed?'readonly':''}>${escape(adminReviewText)}</textarea></label><div class="auto-notify">${icon('bell')}<span>ระบบจะส่งแจ้งผลไปยังผู้ใช้อัตโนมัติ</span></div><p class="error-text" id="form-error" role="alert"></p><div class="dialog-actions">${u?`<button type="button" class="btn" data-user="${u.id}">${icon('user-round')}ดูบัญชีผู้รายงาน</button>`:''}<button type="submit" id="report-submit-btn" class="btn primary" ${submitBtnDisabled?'disabled':''}>${icon('check')}${submitBtnText}</button></div></form>`);
  const trackingPanel=refundTrackingPanel(r);if(trackingPanel)$('#dialog-body').insertAdjacentHTML('beforeend',trackingPanel);
 }
 
@@ -113,18 +124,31 @@ document.addEventListener('change',e=>{
  if(e.target.id==='report-status-select'&&currentRecord?.type==='report'){
   const currentSelected=e.target.value;
   const initialStatus=currentRecord.initialStatus;
-  const isInitialResolved=['ดำเนินการแล้ว','ปิดเรื่อง'].includes(initialStatus);
   const submitBtn=$('#report-submit-btn');
-  if(submitBtn){
-   if(isInitialResolved&&currentSelected===initialStatus){
-    submitBtn.disabled=true;
-    submitBtn.innerHTML=`${icon('check')}ดำเนินการแล้ว (เลือกสถานะอื่นเพื่อเปลี่ยน)`;
-   }else{
+  if(!submitBtn)return;
+  const reportRanks={'รอตรวจสอบ':0,'กำลังตรวจสอบ':1,'ดำเนินการแล้ว':2,'ปิดเรื่อง':3};
+  const currentRank=reportRanks[currentSelected]??0;
+  const initialRank=reportRanks[initialStatus]??0;
+
+  if(initialStatus==='ปิดเรื่อง'){
+   submitBtn.disabled=true;
+   submitBtn.innerHTML=`${icon('check')}ปิดเรื่องเรียบร้อยแล้ว`;
+  }else if(initialStatus==='ดำเนินการแล้ว'){
+   if(currentSelected==='ปิดเรื่อง'){
     submitBtn.disabled=false;
     submitBtn.innerHTML=`${icon('check')}บันทึกผลรายงาน`;
+   }else{
+    submitBtn.disabled=true;
+    submitBtn.innerHTML=`${icon('check')}ดำเนินการแล้ว (เลือกปิดเรื่องเพื่อบันทึก)`;
    }
-   refreshIcons();
+  }else if(currentRank<initialRank){
+   submitBtn.disabled=true;
+   submitBtn.innerHTML=`${icon('alert-circle')}ไม่สามารถย้อนสถานะได้`;
+  }else{
+   submitBtn.disabled=false;
+   submitBtn.innerHTML=`${icon('check')}บันทึกผลรายงาน`;
   }
+  refreshIcons();
  }
 });
 
@@ -143,7 +167,7 @@ async function loadRemote(announce=false){try{const response=await fetch('/api/a
 async function mutate(action){if(state.busy)throw Error('กำลังบันทึก กรุณารอสักครู่');state.busy=true;document.querySelectorAll('dialog button[type=submit],#confirm-submit').forEach(b=>b.disabled=true);try{if(connected){const response=await fetch('/api/admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,revision})});const result=await response.json();if(!response.ok){if(response.status===409)await loadRemote();throw Error(result.error||'บันทึกไม่สำเร็จ')}loadSnapshot(result.data);revision=result.revision}else{loadSnapshot(applyAction(snapshot(),action))}render();toast('บันทึกเรียบร้อยแล้ว');return {saved:connected}}finally{state.busy=false;document.querySelectorAll('dialog button[type=submit],#confirm-submit').forEach(b=>b.disabled=false)}}
 function confirm(title,message,handler){$('#confirm-title').textContent=title;$('#confirm-message').textContent=message;confirmHandler=handler;$('#confirm-dialog').showModal()}
 document.addEventListener('submit',async e=>{if(e.target.id!=='login-form')return;e.preventDefault();const form=e.target;const error=$('#login-error');error.textContent='';const identity=form.identity.value.trim();const password=form.password.value;if(!identity||!password){error.textContent='กรุณากรอก ชื่อผู้ใช้หรืออีเมลและรหัสผ่าน';return}try{const response=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({identity,password})});const data=await response.json().catch(()=>({}));if(!response.ok)throw Error(data.error||'เข้าสู่ระบบไม่สำเร็จ');await loadRemote()}catch{error.textContent='ยังไม่สามารถเชื่อมต่อระบบยืนยันตัวตนได้ กรุณาลองใหม่'}});
-document.addEventListener('submit',async e=>{if(e.target.id!=='report-form')return;e.preventDefault();const form=e.target;const data=new FormData(form);const action={type:'report.update',id:currentRecord.id,status:data.get('status'),note:data.get('note'),notify:true};confirm('ยืนยันบันทึกผลรายงาน','ระบบจะส่งแจ้งผลไปยังผู้ใช้อัตโนมัติ',async()=>{try{await mutate(action);$('#detail-dialog').close()}catch(error){$('#form-error').textContent=error.message}})})
+document.addEventListener('submit',async e=>{if(e.target.id!=='report-form')return;e.preventDefault();const form=e.target;const data=new FormData(form);const newStatus=data.get('status')||currentRecord?.initialStatus;const reportRanks={'รอตรวจสอบ':0,'กำลังตรวจสอบ':1,'ดำเนินการแล้ว':2,'ปิดเรื่อง':3};const initialStatus=currentRecord?.initialStatus;if((reportRanks[newStatus]??0)<(reportRanks[initialStatus]??0)){$('#form-error').textContent='ไม่สามารถย้อนกลับไปสถานะก่อนหน้าได้';return}if(initialStatus==='ปิดเรื่อง'){$('#form-error').textContent='รายงานปิดเรื่องเรียบร้อยแล้ว ไม่สามารถแก้ไขได้';return}if(initialStatus==='ดำเนินการแล้ว'&&newStatus==='ดำเนินการแล้ว'){$('#form-error').textContent='รายงานดำเนินการแล้ว กรุณาปรับเป็นสถานะปิดเรื่องเพื่อบันทึก';return}const action={type:'report.update',id:currentRecord.id,status:newStatus,note:data.get('note'),notify:true};confirm('ยืนยันบันทึกผลรายงาน','ระบบจะส่งแจ้งผลไปยังผู้ใช้อัตโนมัติ',async()=>{try{await mutate(action);$('#detail-dialog').close()}catch(error){$('#form-error').textContent=error.message}})})
 document.addEventListener('submit',async e=>{if(e.target.id!=='refund-tracking-form')return;e.preventDefault();const form=e.target;const data=new FormData(form);const action={type:'refund.track',id:currentRecord.id,status:data.get('refundStatus'),contactedAt:data.get('contactedAt')?new Date(`${data.get('contactedAt')}:00`).toISOString():'',contactNote:data.get('contactNote'),proofReportId:data.get('proofReportId'),verificationNote:data.get('verificationNote')};confirm('ยืนยันบันทึกการติดตามคืนเงิน','ระบบจะเก็บวันเวลาและรายละเอียดการโทรเตือนร้านค้า พร้อมกำหนดเส้นตาย 2 วัน',async()=>{try{await mutate(action);openReport(currentRecord.id)}catch(error){const errorField=$('#refund-form-error');if(errorField)errorField.textContent=error.message;else toast(error.message,'error')}})});
 document.addEventListener('click',async e=>{
  const notification=e.target.closest('[data-notification]');
