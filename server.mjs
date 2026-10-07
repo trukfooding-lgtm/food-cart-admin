@@ -112,21 +112,8 @@ function normalizeSupabaseWebhook(payload) {
     source_updated_at: updatedAt
   }};
   if (table === 'merchant_issue_reports' || table === 'customer_issue_reports') {
-    const rawImage = row.image_url;
-    let imageUrls = [];
-    if (rawImage) {
-      if (typeof rawImage === 'string') {
-        try {
-          const parsed = JSON.parse(rawImage);
-          if (Array.isArray(parsed)) imageUrls = parsed.filter(Boolean);
-          else if (typeof parsed === 'string') imageUrls = [parsed];
-        } catch {
-          imageUrls = [rawImage];
-        }
-      } else if (Array.isArray(rawImage)) {
-        imageUrls = rawImage.filter(Boolean);
-      }
-    }
+    const rawImage = row.image_url || row.evidence_urls || row.evidence_url;
+    let imageUrls = parseEvidenceList(rawImage);
     const userDetails = text(row.details || row.description || row.note);
     const firstImg = imageUrls[0] || (typeof rawImage === 'string' ? rawImage : '');
     return {
@@ -189,25 +176,31 @@ function mapUser(row) {
   };
 }
 
+function parseEvidenceList(val) {
+  if (!val) return [];
+  if (Array.isArray(val)) return val.flatMap(parseEvidenceList).filter(Boolean);
+  const s = String(val).trim();
+  if (!s || s === '[]' || s === '{}' || s === 'null') return [];
+  if (s.startsWith('[') && s.endsWith(']')) {
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed)) return parsed.flatMap(parseEvidenceList).filter(Boolean);
+    } catch {}
+  }
+  if (s.startsWith('{') && s.endsWith('}')) {
+    const items = s.slice(1, -1).split(',').map(x => x.trim().replace(/^["']|["']$/g, ''));
+    return items.filter(Boolean);
+  }
+  return [s];
+}
+
 function mapReport(row) {
-  let evidenceUrls = [];
-  const rawImg = row.image_url || '';
-  if (rawImg) {
-    if (typeof rawImg === 'string') {
-      try {
-        const parsed = JSON.parse(rawImg);
-        if (Array.isArray(parsed)) evidenceUrls = parsed.filter(Boolean);
-        else if (typeof parsed === 'string') evidenceUrls = [parsed];
-      } catch {
-        evidenceUrls = [rawImg];
-      }
-    } else if (Array.isArray(rawImg)) {
-      evidenceUrls = rawImg.filter(Boolean);
-    }
-  }
-  if (!evidenceUrls.length && Number(row.evidence_count || 0) > 0) {
-    evidenceUrls = ['/evidence/report-evidence.png'];
-  }
+  const rawList = [
+    ...parseEvidenceList(row.evidence_urls),
+    ...parseEvidenceList(row.image_url),
+    ...parseEvidenceList(row.imageUrl)
+  ];
+  const evidenceUrls = [...new Set(rawList.filter(Boolean))];
   const userDetails = row.user_details || (row.admin_note ? '' : row.note) || '';
   const adminNote = row.admin_note || (row.user_details && row.note !== row.user_details ? row.note : '') || '';
 
@@ -229,10 +222,10 @@ function mapReport(row) {
     originalDetails: userDetails,
     admin_note: adminNote,
     reviewNote: adminNote,
-    imageUrl: evidenceUrls[0] || rawImg || '/evidence/report-evidence.png',
-    image_url: rawImg || evidenceUrls[0] || '',
+    imageUrl: evidenceUrls[0] || '',
+    image_url: evidenceUrls[0] || '',
     evidenceUrls: evidenceUrls,
-    evidenceCount: Number(row.evidence_count || evidenceUrls.length || (rawImg ? 1 : 0)),
+    evidenceCount: Number(evidenceUrls.length || row.evidence_count || 0),
     updatedAt: row.updated_at
   };
 }
@@ -273,9 +266,9 @@ async function insertSeed(client, source) {
   }
   for (const report of state.reports) {
     await client.query(`INSERT INTO public.reports
-      (report_id, title, reporter_id, reporter_type, reporter_name, shop_name, issue_type, order_id, status, priority, note, user_details, image_url, evidence_count, created_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now(),now()) ON CONFLICT (report_id) DO UPDATE SET image_url=COALESCE(public.reports.image_url, excluded.image_url), user_details=COALESCE(public.reports.user_details, excluded.user_details)`,
-      [report.id, text(report.name, 'รายงานปัญหา'), text(report.userId), report.reporterType === 'Shop' ? 'Shop' : 'Customer', text(report.person), text(report.shop), text(report.type, 'Other'), text(report.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(report.status) ? report.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(report.priority) ? report.priority : 'ปกติ', text(report.note), text(report.user_details || report.details || report.note), text(report.image_url || report.imageUrl || '/evidence/report-evidence.png'), Number(report.evidenceCount || 0)]);
+      (report_id, title, reporter_id, reporter_type, reporter_name, shop_name, issue_type, order_id, status, priority, note, user_details, image_url, evidence_urls, evidence_count, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now(),now()) ON CONFLICT (report_id) DO UPDATE SET image_url=COALESCE(public.reports.image_url, excluded.image_url), evidence_urls=COALESCE(public.reports.evidence_urls, excluded.evidence_urls), user_details=COALESCE(public.reports.user_details, excluded.user_details)`,
+      [report.id, text(report.name, 'รายงานปัญหา'), text(report.userId), report.reporterType === 'Shop' ? 'Shop' : 'Customer', text(report.person), text(report.shop), text(report.type, 'Other'), text(report.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(report.status) ? report.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(report.priority) ? report.priority : 'ปกติ', text(report.note), text(report.user_details || report.details || report.note), text(report.image_url || report.imageUrl || ''), JSON.stringify(Array.isArray(report.evidenceUrls) ? report.evidenceUrls : (report.image_url ? [report.image_url] : [])), Number(report.evidenceCount || 0)]);
   }
   for (const notification of state.notifications) {
     await client.query(`INSERT INTO public.notifications
@@ -306,9 +299,12 @@ async function ensureDb() {
   try {
     await client.query(await readSchema());
     await client.query(`
+      ALTER TABLE IF EXISTS public.reports ADD COLUMN IF NOT EXISTS evidence_urls text;
       ALTER TABLE IF EXISTS public.reports ADD COLUMN IF NOT EXISTS image_url text;
       ALTER TABLE IF EXISTS public.reports ADD COLUMN IF NOT EXISTS user_details text;
       ALTER TABLE IF EXISTS public.reports ADD COLUMN IF NOT EXISTS admin_note text;
+      UPDATE public.reports SET evidence_urls = image_url WHERE (evidence_urls IS NULL OR evidence_urls = '' OR evidence_urls = '[]') AND image_url IS NOT NULL AND image_url != '';
+      UPDATE public.reports SET image_url = evidence_urls WHERE (image_url IS NULL OR image_url = '') AND evidence_urls IS NOT NULL AND evidence_urls != '' AND evidence_urls != '[]';
     `);
     try {
       const tblCheck = await client.query("SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='merchant_issue_reports'");
@@ -316,11 +312,12 @@ async function ensureDb() {
         await client.query(`
           UPDATE public.reports r
           SET 
-            image_url = m.image_url,
+            evidence_urls = COALESCE(NULLIF(r.evidence_urls, ''), NULLIF(r.evidence_urls, '[]'), m.image_url),
+            image_url = COALESCE(NULLIF(r.image_url, ''), m.image_url),
             user_details = COALESCE(NULLIF(r.user_details, ''), m.details)
           FROM public.merchant_issue_reports m
           WHERE (r.report_id = m.id::text OR r.report_id = ('RPT-' || lpad(m.id::text, 5, '0')) OR (m.order_reference IS NOT NULL AND m.order_reference = r.order_id))
-            AND (r.image_url IS NULL OR r.image_url = '')
+            AND (r.evidence_urls IS NULL OR r.evidence_urls = '' OR r.evidence_urls = '[]')
             AND m.image_url IS NOT NULL AND m.image_url != '';
         `);
       }
@@ -330,16 +327,25 @@ async function ensureDb() {
       if (evtCheck.rows.length) {
         await client.query(`
           UPDATE public.reports r
-          SET image_url = COALESCE(
-            NULLIF(e.payload->'data'->>'image_url', ''),
-            NULLIF(e.payload->'record'->>'image_url', '')
-          )
+          SET 
+            evidence_urls = COALESCE(
+              NULLIF(r.evidence_urls, ''),
+              NULLIF(r.evidence_urls, '[]'),
+              NULLIF(e.payload->'data'->>'evidence_urls', ''),
+              NULLIF(e.payload->'data'->>'image_url', ''),
+              NULLIF(e.payload->'record'->>'image_url', '')
+            ),
+            image_url = COALESCE(
+              NULLIF(r.image_url, ''),
+              NULLIF(e.payload->'data'->>'image_url', ''),
+              NULLIF(e.payload->'record'->>'image_url', '')
+            )
           FROM public.integration_events e
           WHERE (e.target_id = r.report_id 
               OR e.payload->'data'->>'report_id' = r.report_id 
               OR e.payload->'record'->>'id'::text = r.report_id)
-            AND (r.image_url IS NULL OR r.image_url = '')
-            AND COALESCE(e.payload->'data'->>'image_url', e.payload->'record'->>'image_url') IS NOT NULL;
+            AND (r.evidence_urls IS NULL OR r.evidence_urls = '' OR r.evidence_urls = '[]')
+            AND COALESCE(e.payload->'data'->>'evidence_urls', e.payload->'data'->>'image_url', e.payload->'record'->>'image_url') IS NOT NULL;
         `);
       }
     } catch (_) {}
@@ -451,7 +457,8 @@ async function handleIntegrationEvent(event) {
     } else if (eventType === 'order.upsert') {
       await client.query(`INSERT INTO public.app_orders (order_id, customer_id, merchant_id, total_amount, status, created_at, source_updated_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT (order_id) DO UPDATE SET customer_id=excluded.customer_id,merchant_id=excluded.merchant_id,total_amount=excluded.total_amount,status=excluded.status,source_updated_at=excluded.source_updated_at,updated_at=now()`, [text(data.order_id || data.id), text(data.customer_id) || null, text(data.merchant_id) || null, data.total_amount == null ? null : Number(data.total_amount), text(data.status) || null, data.created_at ? safeDate(data.created_at) : null, data.source_updated_at ? safeDate(data.source_updated_at) : null]);
     } else if (eventType === 'report.created' || eventType === 'report.updated') {
-      await client.query(`INSERT INTO public.reports (report_id,title,reporter_id,reporter_type,reporter_name,shop_name,issue_type,order_id,status,priority,note,user_details,image_url,evidence_count,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now()) ON CONFLICT (report_id) DO UPDATE SET title=excluded.title,reporter_id=excluded.reporter_id,reporter_type=excluded.reporter_type,reporter_name=excluded.reporter_name,shop_name=excluded.shop_name,issue_type=excluded.issue_type,order_id=excluded.order_id,status=excluded.status,priority=excluded.priority,note=excluded.note,user_details=COALESCE(excluded.user_details, public.reports.user_details),image_url=COALESCE(excluded.image_url, public.reports.image_url),evidence_count=excluded.evidence_count,updated_at=now()`, [text(data.report_id || data.id), text(data.title || data.name, 'รายงานปัญหา'), text(data.reporter_id || data.user_id) || null, data.reporter_type === 'Shop' ? 'Shop' : 'Customer', text(data.reporter_name || data.person) || null, text(data.shop_name || data.shop) || null, text(data.issue_type || data.type, 'Other'), text(data.order_id || data.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(data.status) ? data.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ', text(data.note), text(data.user_details || data.details || data.note), text(data.image_url || (Array.isArray(data.evidence_urls) ? data.evidence_urls[0] : '')), Number(data.evidence_count || data.evidenceCount || 0), data.created_at ? safeDate(data.created_at) : new Date()]);
+      const evUrlsJson = JSON.stringify(Array.isArray(data.evidence_urls) ? data.evidence_urls : (data.image_url ? [data.image_url] : []));
+      await client.query(`INSERT INTO public.reports (report_id,title,reporter_id,reporter_type,reporter_name,shop_name,issue_type,order_id,status,priority,note,user_details,image_url,evidence_urls,evidence_count,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now()) ON CONFLICT (report_id) DO UPDATE SET title=excluded.title,reporter_id=excluded.reporter_id,reporter_type=excluded.reporter_type,reporter_name=excluded.reporter_name,shop_name=excluded.shop_name,issue_type=excluded.issue_type,order_id=excluded.order_id,status=excluded.status,priority=excluded.priority,note=excluded.note,user_details=COALESCE(NULLIF(excluded.user_details, ''), public.reports.user_details),image_url=COALESCE(NULLIF(excluded.image_url, ''), public.reports.image_url),evidence_urls=COALESCE(NULLIF(excluded.evidence_urls, ''), public.reports.evidence_urls),evidence_count=excluded.evidence_count,updated_at=now()`, [text(data.report_id || data.id), text(data.title || data.name, 'รายงานปัญหา'), text(data.reporter_id || data.user_id) || null, data.reporter_type === 'Shop' ? 'Shop' : 'Customer', text(data.reporter_name || data.person) || null, text(data.shop_name || data.shop) || null, text(data.issue_type || data.type, 'Other'), text(data.order_id || data.orderId) || null, ['รอตรวจสอบ', 'กำลังตรวจสอบ', 'ดำเนินการแล้ว', 'ปิดเรื่อง'].includes(data.status) ? data.status : 'รอตรวจสอบ', ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ', text(data.note), text(data.user_details || data.details || data.note), text(data.image_url || (Array.isArray(data.evidence_urls) ? data.evidence_urls[0] : '')), evUrlsJson, Number(data.evidence_count || data.evidenceCount || 0), data.created_at ? safeDate(data.created_at) : new Date()]);
       if (eventType === 'report.created') await client.query(`INSERT INTO public.notifications (notification_id, source_type, source_id, title, body, priority, delivery_status) VALUES ($1,'report',$2,$3,$4,$5,'รอส่ง')`, [crypto.randomUUID(), text(data.report_id || data.id), 'มีรายงานใหม่', text(data.title || data.name, 'มีรายงานใหม่'), ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ']);
     } else if (eventType === 'notification.created') {
       await client.query(`INSERT INTO public.notifications (notification_id,recipient_id,source_type,source_id,title,body,priority,delivery_status,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (notification_id) DO NOTHING`, [text(data.notification_id || data.id, crypto.randomUUID()), text(data.recipient_id) || null, text(data.source_type) || null, text(data.source_id) || null, text(data.title, 'การแจ้งเตือน'), text(data.body), ['สูงสุด', 'สูง', 'ปกติ', 'ต่ำ'].includes(data.priority) ? data.priority : 'ปกติ', text(data.delivery_status, 'รอส่ง'), data.created_at ? safeDate(data.created_at) : new Date()]);

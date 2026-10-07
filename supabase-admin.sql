@@ -155,3 +155,5 @@ alter table public.reports enable row level security;
 alter table public.notifications enable row level security;
 alter table public.admin_actions enable row level security;
 alter table public.integration_events enable row level security;
+
+alter table if exists public.reports add column if not exists evidence_urls text not null default '';
