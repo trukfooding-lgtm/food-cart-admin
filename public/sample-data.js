@@ -1,7 +1,7 @@
 export function createInitialState(){
  const people=['กมลชนก ใจดี','ณัฐวุฒิ ศรีสุข','พิมพ์ชนก วงศ์ดี','ธนกร มีทรัพย์','วราภรณ์ แสงทอง','สุรชัย พูนสุข','นภัสสร จันทรา','ศุภชัย อินทร์แก้ว'];
  const shops=['ครัวป้าสุ รถกับข้าว','Coffee on Wheels','ผลไม้สด ลุงชัย','ขนมหวานบ้านอิ่ม','ผักสดจากสวน','ปังปิ้ง พี่หมี'];
- const names=['แอปพลิเคชันทำงานผิดปกติ','คำสั่งซื้อมีปัญหา','รายละเอียดเพิ่มเติมเกี่ยวกับการใช้งาน','ชำระเงินแล้วแต่คำสั่งซื้อไม่สมบูรณ์','แอปพลิเคชันแสดงข้อมูลไม่ถูกต้อง','ไม่สามารถเปิดดูร้านค้าได้','ขอความช่วยเหลือจากทีมงาน','ข้อมูลคำสั่งซื้อไม่ตรงกับที่ได้รับ','พบข้อผิดพลาดระหว่างใช้งาน','ต้องการรายงานปัญหาอื่น','การแจ้งเตือนไม่แสดงผล','ไม่สามารถส่งรายงานจากแอปได้'];
+ const names=['แอปพลิเคชันทำงานผิดปกติ','คำสั่งซื้อมีปัญหา','รายละเอียดเพิ่มเติมเกี่ยวกับการใช้งาน','ออเดอร์ไม่ตรงกับที่สั่ง','แอปพลิเคชันแสดงข้อมูลไม่ถูกต้อง','ไม่สามารถเปิดดูร้านค้าได้','ขอความช่วยเหลือจากทีมงาน','ข้อมูลคำสั่งซื้อไม่ตรงกับที่ได้รับ','พบข้อผิดพลาดระหว่างใช้งาน','ต้องการรายงานปัญหาอื่น','การแจ้งเตือนไม่แสดงผล','ไม่สามารถส่งรายงานจากแอปได้'];
  const reports=names.map((name,i)=>({id:'RPT-'+String(248-i).padStart(5,'0'),name,person:people[i%8],shop:shops[i%6],reporterType:i%2?'Shop':'Customer',type:['Problem with application','Problem with order','Other'][i%3],orderId:i%3===1?'ORD-'+String(88428-i):'',status:['รอตรวจสอบ','กำลังตรวจสอบ','ดำเนินการแล้ว','ปิดเรื่อง'][i%4],priority:i<2||i===7||i===9?'สูง':'ปกติ',time:['10:42','10:15','09:58','09:30','09:15','09:02','08:50','08:34','08:20','08:12','08:04','07:53'][i],userId:'USR-'+String(i%6+9).padStart(3,'0'),note:'',details:name,user_details:name,imageUrl:'',image_url:'',evidenceUrls:[],evidenceCount:0}));
  const shopProfiles=[
   {phone:'081-234-5678',category:'อาหารปรุงสุก',lineId:'@ครัวป้าสุ',facebook:'facebook.com/kruapasuu',lat:'13.7563',lng:'100.5018'},
@@ -13,8 +13,6 @@ export function createInitialState(){
  ];
  const users=[...people,...['สุภาวดี คงดี','กิตติพงษ์ วัฒนา','สมชาย ใจเย็น','อรทัย บุญมา','ลลิตา สดใส','สมพร รุ่งเรือง']].map((name,i)=>({id:'USR-'+String(i+1).padStart(3,'0'),name:i>=8?shops[i-8]:name,email:'member'+(i+1)+'@example.com',role:i<8?'Customer':'Shop',status:i===13?'ระงับบัญชี':'ใช้งานปกติ',joined:'1 ก.ย. 2569',shop:i<8?'—':shops[i-8],...(i>=8?shopProfiles[i-8]:{phone:'',category:'',lineId:'',facebook:'',lat:'',lng:''})}));
  const amounts=[185,120,240,85,350,95,160,210,145,70,290,135,250,175,480,60,310,220];
- // Payment / refund sample data is intentionally disabled until its separate scope is approved.
- const transactions=[];
  const notifications=[{id:'N-1',title:'มีรายงานใหม่ 4 รายการ',body:'ตรวจสอบรายการที่มีความสำคัญสูงในศูนย์รายงาน',time:'วันนี้ 10:42',priority:'สูง',read:false}];
- return {reports,users,transactions,notifications,history:[]};
+ return {reports,users,notifications,history:[]};
 }

@@ -1,5 +1,5 @@
 -- โครงสร้างฐานข้อมูล Admin สำหรับฟังก์ชันผู้ใช้งาน รายงาน และการแจ้งเตือน
--- ไม่เก็บรหัสผ่าน และไม่สร้างตาราง Payment Gateway / transactions / refunds
+-- ไม่เก็บรหัสผ่าน และไม่มีตารางชำระเงิน / transactions / refunds (ยกเลิกการชำระเงินผ่านแอปแล้ว)
 
 create table if not exists public.admin_workspaces (
   user_id text primary key,

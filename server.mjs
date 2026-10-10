@@ -27,6 +27,15 @@ app.use(express.static('public', {extensions: ['html']}));
 
 const json = (res, value, status = 200) => res.status(status).json(value);
 const now = () => new Date().toISOString();
+// ระบบชำระเงินผ่านแอปถูกยกเลิกแล้ว: ไม่รับรายงานหรือแจ้งเตือนเรื่องสลิป/ชำระเงิน/คืนเงินเข้าสู่ Admin
+function isPaymentReport(data) {
+  const issueType = String(data?.issue_type ?? data?.type ?? '').trim();
+  const title = String(data?.title ?? data?.name ?? '').trim();
+  return ['SLIP_MISMATCH', 'PAYMENT_NOT_RECEIVED'].includes(issueType.toUpperCase()) || /(slip|payment|refund|สลิป|ชำระเงิน|คืนเงิน)/i.test(`${issueType} ${title}`);
+}
+function isPaymentNotification(data) {
+  return /(slip|payment|refund|ธุรกรรม|สลิป|ชำระเงิน|คืนเงิน)/i.test(`${data?.title ?? ''} ${data?.body ?? data?.message ?? ''}`);
+}
 const text = (value, fallback = '') => String(value ?? fallback).trim();
 const validText = (value, min, max) => typeof value === 'string' && value.trim().length >= min && value.trim().length <= max;
 const safeDate = (value) => value ? new Date(value) : new Date();
@@ -150,10 +159,8 @@ function normalizeSnapshot(input) {
   return {
     users: Array.isArray(input?.users) ? input.users : [],
     reports: Array.isArray(input?.reports) ? input.reports : [],
-    notifications: (Array.isArray(input?.notifications) ? input.notifications : []).filter((notification) => !/(refund|payment gateway|ธุรกรรม|คืนเงิน)/i.test(`${notification?.title || ''} ${notification?.body || ''}`)),
-    history: Array.isArray(input?.history) ? input.history : [],
-    // Payment Gateway / transaction / refund UI ถูกปิดไว้ชั่วคราวตามขอบเขตที่อนุมัติ
-    transactions: []
+    notifications: (Array.isArray(input?.notifications) ? input.notifications : []).filter((notification) => !isPaymentNotification(notification)),
+    history: Array.isArray(input?.history) ? input.history : []
   };
 }
 
@@ -373,7 +380,7 @@ async function snapshotFrom(client) {
     client.query('SELECT revision FROM public.admin_workspaces WHERE user_id = $1', [workspaceId])
   ]);
   return {
-    data: {users: users.rows.map(mapUser), reports: reports.rows.map(mapReport), notifications: notifications.rows.map(mapNotification), history: history.rows.map(mapHistory), transactions: []},
+    data: {users: users.rows.map(mapUser), reports: reports.rows.map(mapReport), notifications: notifications.rows.map(mapNotification), history: history.rows.map(mapHistory)},
     revision: Number(workspace.rows[0]?.revision || 0)
   };
 }
@@ -424,8 +431,6 @@ async function writeRelationalAction(action, revision, admin) {
     } else if (action?.type === 'notification.read') {
       await client.query(`UPDATE public.notifications SET is_read=true, read_at=COALESCE(read_at, now()), updated_at=now() WHERE is_read=false`);
       await recordAction(client, admin, 'อ่านการแจ้งเตือนทั้งหมด', 'notification', 'all', 'ผู้ดูแลอ่านการแจ้งเตือน');
-    } else if (String(action?.type || '').startsWith('refund') || String(action?.type || '').startsWith('payment')) {
-      throw new Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
     } else {
       throw new Error('ไม่รองรับการดำเนินการนี้');
     }
@@ -447,6 +452,8 @@ async function handleIntegrationEvent(event) {
   const data = event?.data && typeof event.data === 'object' ? event.data : {};
   const supported = new Set(['user.upsert', 'order.upsert', 'report.created', 'report.updated', 'notification.created']);
   if (!eventId || !supported.has(eventType)) throw new Error('event ไม่รองรับหรือไม่มี event_id');
+  if ((eventType === 'report.created' || eventType === 'report.updated') && isPaymentReport(data)) return {duplicate: false, ignored: true};
+  if (eventType === 'notification.created' && isPaymentNotification(data)) return {duplicate: false, ignored: true};
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -520,7 +527,6 @@ app.post('/api/admin', requireAdmin, async (req, res) => {
       return json(res, saved);
     }
     if (memory.revision !== revision) return json(res, {error: 'ข้อมูลเปลี่ยนแปลง กรุณาโหลดใหม่'}, 409);
-    if (String(req.body.action.type || '').startsWith('refund') || String(req.body.action.type || '').startsWith('payment')) throw new Error('ฟังก์ชันการชำระเงินและคืนเงินถูกปิดไว้ชั่วคราว');
     memory = {payload: normalizeSnapshot(applyAction(memory.payload, req.body.action)), revision: revision + 1};
     return json(res, {data: memory.payload, revision: memory.revision});
   } catch (error) {
