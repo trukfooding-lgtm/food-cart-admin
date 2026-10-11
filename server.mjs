@@ -246,6 +246,8 @@ function mapNotification(row) {
     priority: row.priority,
     read: Boolean(row.is_read),
     recipient: row.recipient_id || '',
+    sourceType: row.source_type || '',
+    sourceId: row.source_id || '',
     delivery: row.delivery_status
   };
 }
